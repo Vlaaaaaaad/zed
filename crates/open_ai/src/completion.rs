@@ -22,6 +22,38 @@ use crate::{
     ResponseStreamEvent, ToolCall, ToolCallContent,
 };
 
+/// Some models/providers require every assistant message that contains `tool_calls`
+/// to also carry a non-empty `reasoning_content` but sometimes there is no reasoning, so
+/// insert a placeholder to ensure the API does not reject the request
+const REASONING_PLACEHOLDER: &str = ".";
+
+/// Append any accumulated reasoning to the most recent assistant message, or
+/// create a new assistant message that holds only the reasoning.
+fn flush_reasoning(
+    current_reasoning: &mut Option<String>,
+    messages: &mut Vec<crate::RequestMessage>,
+) {
+    if let Some(reasoning) = current_reasoning.take() {
+        if let Some(crate::RequestMessage::Assistant {
+            reasoning_content,
+            ..
+        }) = messages.last_mut()
+        {
+            if let Some(existing) = reasoning_content {
+                existing.push_str(&reasoning);
+            } else {
+                *reasoning_content = Some(reasoning);
+            }
+        } else {
+            messages.push(crate::RequestMessage::Assistant {
+                content: None,
+                tool_calls: Vec::new(),
+                reasoning_content: Some(reasoning),
+            });
+        }
+    }
+}
+
 pub fn into_open_ai(
     request: LanguageModelRequest,
     model_id: &str,
@@ -34,9 +66,11 @@ pub fn into_open_ai(
 
     let mut messages = Vec::new();
     for message in request.messages {
+        let mut current_reasoning: Option<String> = None;
+
         for content in message.content {
             match content {
-                MessageContent::Text(text) | MessageContent::Thinking { text, .. } => {
+                MessageContent::Text(text) => {
                     let should_add = if message.role == Role::User {
                         // Including whitespace-only user messages can cause error with OpenAI compatible APIs
                         // See https://github.com/zed-industries/zed/issues/40097
@@ -50,6 +84,24 @@ pub fn into_open_ai(
                             message.role,
                             &mut messages,
                         );
+                    }
+                }
+                MessageContent::Thinking { text, .. } => {
+                    if message.role == Role::Assistant {
+                        current_reasoning.get_or_insert_with(String::new).push_str(&text);
+                    } else {
+                        let should_add = if message.role == Role::User {
+                            !text.trim().is_empty()
+                        } else {
+                            !text.is_empty()
+                        };
+                        if should_add {
+                            add_message_content_part(
+                                MessagePart::Text { text },
+                                message.role,
+                                &mut messages,
+                            );
+                        }
                     }
                 }
                 MessageContent::RedactedThinking(_) => {}
@@ -77,14 +129,22 @@ pub fn into_open_ai(
                         },
                     };
 
-                    if let Some(crate::RequestMessage::Assistant { tool_calls, .. }) =
-                        messages.last_mut()
-                    {
-                        tool_calls.push(tool_call);
+                    let should_merge = matches!(
+                        messages.last(),
+                        Some(crate::RequestMessage::Assistant { .. })
+                    );
+                    if should_merge {
+                        if let Some(crate::RequestMessage::Assistant { tool_calls, .. }) =
+                            messages.last_mut()
+                        {
+                            tool_calls.push(tool_call);
+                        }
+                        flush_reasoning(&mut current_reasoning, &mut messages);
                     } else {
                         messages.push(crate::RequestMessage::Assistant {
                             content: None,
                             tool_calls: vec![tool_call],
+                            reasoning_content: current_reasoning.take(),
                         });
                     }
                 }
@@ -110,6 +170,26 @@ pub fn into_open_ai(
                         tool_call_id: tool_result.tool_use_id.to_string(),
                     });
                 }
+            }
+        }
+
+        if message.role == Role::Assistant {
+            flush_reasoning(&mut current_reasoning, &mut messages);
+        }
+    }
+
+    // Some models/providers require reasoning_content
+    // on all assistant messages with tool_calls. If an assistant message has
+    // tool_calls but no reasoning_content, inject a placeholder.
+    for message in &mut messages {
+        if let crate::RequestMessage::Assistant {
+            tool_calls,
+            reasoning_content,
+            ..
+        } = message
+        {
+            if !tool_calls.is_empty() && reasoning_content.is_none() {
+                *reasoning_content = Some(REASONING_PLACEHOLDER.to_string());
             }
         }
     }
@@ -362,6 +442,7 @@ fn add_message_content_part(
                 Role::Assistant => crate::RequestMessage::Assistant {
                     content: Some(crate::MessageContent::from(vec![new_part])),
                     tool_calls: Vec::new(),
+                    reasoning_content: None,
                 },
                 Role::System => crate::RequestMessage::System {
                     content: crate::MessageContent::from(vec![new_part]),
@@ -1688,6 +1769,441 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, LanguageModelCompletionEvent::Thinking { .. })),
             "OutputItemDone reasoning should not produce Thinking events"
+        );
+    }
+
+    #[test]
+    fn into_open_ai_includes_reasoning_content_for_assistant_messages() {
+        let tool_use = LanguageModelToolUse {
+            id: LanguageModelToolUseId::from("call-42"),
+            name: Arc::from("get_weather"),
+            raw_input: "{\"city\":\"Boston\"}".into(),
+            input: json!({ "city": "Boston" }),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+        let tool_result = LanguageModelToolResult {
+            tool_use_id: LanguageModelToolUseId::from("call-42"),
+            tool_name: Arc::from("get_weather"),
+            is_error: false,
+            content: LanguageModelToolResultContent::Text(Arc::from("Sunny")),
+            output: Some(json!({ "forecast": "Sunny" })),
+        };
+
+        let request = LanguageModelRequest {
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            messages: vec![
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text("What's the weather?".into())],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::Assistant,
+                    content: vec![
+                        MessageContent::Thinking {
+                            text: "The user wants weather.".into(),
+                            signature: None,
+                        },
+                        MessageContent::ToolUse(tool_use),
+                    ],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::Assistant,
+                    content: vec![MessageContent::ToolResult(tool_result)],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::Assistant,
+                    content: vec![
+                        MessageContent::Thinking {
+                            text: "Now I have the result.".into(),
+                            signature: None,
+                        },
+                        MessageContent::Text("It's sunny.".into()),
+                    ],
+                    cache: false,
+                    reasoning_details: None,
+                },
+            ],
+            tools: vec![],
+            tool_choice: None,
+            stop: vec![],
+            temperature: None,
+            thinking_allowed: true,
+            thinking_effort: None,
+            speed: None,
+        };
+
+        let open_ai_request = into_open_ai(
+            request,
+            "kimi-k2.5",
+            false,
+            false,
+            None,
+            None,
+        );
+
+        assert_eq!(open_ai_request.messages.len(), 4);
+
+        // First message is user
+        assert!(
+            matches!(&open_ai_request.messages[0], crate::RequestMessage::User { .. })
+        );
+
+        // Second message is assistant with tool_calls and reasoning_content
+        assert!(
+            matches!(
+                &open_ai_request.messages[1],
+                crate::RequestMessage::Assistant {
+                    content: None,
+                    tool_calls,
+                    reasoning_content: Some(reasoning),
+                } if tool_calls.len() == 1 && reasoning == "The user wants weather."
+            )
+        );
+
+        // Third message is tool result
+        assert!(
+            matches!(&open_ai_request.messages[2], crate::RequestMessage::Tool { .. })
+        );
+
+        // Fourth message is assistant with text and reasoning_content
+        assert!(
+            matches!(
+                &open_ai_request.messages[3],
+                crate::RequestMessage::Assistant {
+                    content: Some(crate::MessageContent::Plain(text)),
+                    tool_calls,
+                    reasoning_content: Some(reasoning),
+                } if text == "It's sunny." && tool_calls.is_empty() && reasoning == "Now I have the result."
+            )
+        );
+    }
+
+    #[test]
+    fn into_open_ai_appends_interleaved_thinking_to_existing_reasoning() {
+        let tool_use_1 = LanguageModelToolUse {
+            id: LanguageModelToolUseId::from("call-1"),
+            name: Arc::from("get_weather"),
+            raw_input: "{\"city\":\"Boston\"}".into(),
+            input: json!({ "city": "Boston" }),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+        let tool_use_2 = LanguageModelToolUse {
+            id: LanguageModelToolUseId::from("call-2"),
+            name: Arc::from("get_weather"),
+            raw_input: "{\"city\":\"NYC\"}".into(),
+            input: json!({ "city": "NYC" }),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+
+        let request = LanguageModelRequest {
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            messages: vec![
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text("What's the weather?".into())],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::Assistant,
+                    content: vec![
+                        MessageContent::Thinking {
+                            text: "First thought. ".into(),
+                            signature: None,
+                        },
+                        MessageContent::ToolUse(tool_use_1),
+                        MessageContent::Thinking {
+                            text: "Second thought. ".into(),
+                            signature: None,
+                        },
+                        MessageContent::ToolUse(tool_use_2),
+                    ],
+                    cache: false,
+                    reasoning_details: None,
+                },
+            ],
+            tools: vec![],
+            tool_choice: None,
+            stop: vec![],
+            temperature: None,
+            thinking_allowed: true,
+            thinking_effort: None,
+            speed: None,
+        };
+
+        let open_ai_request = into_open_ai(
+            request,
+            "kimi-k2.5",
+            false,
+            false,
+            None,
+            None,
+        );
+
+        assert_eq!(open_ai_request.messages.len(), 2);
+
+        assert!(
+            matches!(
+                &open_ai_request.messages[1],
+                crate::RequestMessage::Assistant {
+                    content: None,
+                    tool_calls,
+                    reasoning_content: Some(reasoning),
+                } if tool_calls.len() == 2 && reasoning == "First thought. Second thought. "
+            )
+        );
+    }
+
+    #[test]
+    fn into_open_ai_injects_reasoning_placeholder_for_tool_calls_without_thinking() {
+        let tool_use = LanguageModelToolUse {
+            id: LanguageModelToolUseId::from("call-42"),
+            name: Arc::from("get_weather"),
+            raw_input: "{\"city\":\"Boston\"}".into(),
+            input: json!({ "city": "Boston" }),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+
+        let request = LanguageModelRequest {
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            messages: vec![
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text("What's the weather?".into())],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::Assistant,
+                    content: vec![MessageContent::ToolUse(tool_use)],
+                    cache: false,
+                    reasoning_details: None,
+                },
+            ],
+            tools: vec![],
+            tool_choice: None,
+            stop: vec![],
+            temperature: None,
+            thinking_allowed: true,
+            thinking_effort: None,
+            speed: None,
+        };
+
+        let open_ai_request = into_open_ai(
+            request,
+            "kimi-k2.5",
+            false,
+            false,
+            None,
+            None,
+        );
+
+        assert_eq!(open_ai_request.messages.len(), 2);
+
+        // Second message is assistant with tool_calls and placeholder reasoning_content
+        assert!(
+            matches!(
+                &open_ai_request.messages[1],
+                crate::RequestMessage::Assistant {
+                    content: None,
+                    tool_calls,
+                    reasoning_content: Some(reasoning),
+                } if tool_calls.len() == 1 && reasoning == "."
+            )
+        );
+    }
+
+    #[test]
+    fn into_open_ai_assistant_thinking_only() {
+        let request = LanguageModelRequest {
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            messages: vec![
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text("Hello".into())],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::Assistant,
+                    content: vec![MessageContent::Thinking {
+                        text: "Just thinking".into(),
+                        signature: None,
+                    }],
+                    cache: false,
+                    reasoning_details: None,
+                },
+            ],
+            tools: Vec::new(),
+            tool_choice: None,
+            stop: Vec::new(),
+            temperature: None,
+            thinking_allowed: true,
+            thinking_effort: None,
+            speed: None,
+        };
+
+        let open_ai_request = into_open_ai(
+            request,
+            "kimi-k2.5",
+            false,
+            false,
+            None,
+            None,
+        );
+
+        assert_eq!(open_ai_request.messages.len(), 2);
+
+        assert!(
+            matches!(
+                &open_ai_request.messages[1],
+                crate::RequestMessage::Assistant {
+                    content: None,
+                    tool_calls,
+                    reasoning_content: Some(reasoning),
+                } if tool_calls.is_empty() && reasoning == "Just thinking"
+            )
+        );
+    }
+
+    #[test]
+    fn into_open_ai_plain_assistant_text_has_no_reasoning_content() {
+        let request = LanguageModelRequest {
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            messages: vec![
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text("Hello".into())],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::Assistant,
+                    content: vec![MessageContent::Text("Hi there!".into())],
+                    cache: false,
+                    reasoning_details: None,
+                },
+            ],
+            tools: Vec::new(),
+            tool_choice: None,
+            stop: Vec::new(),
+            temperature: None,
+            thinking_allowed: true,
+            thinking_effort: None,
+            speed: None,
+        };
+
+        let open_ai_request = into_open_ai(
+            request,
+            "kimi-k2.6",
+            false,
+            false,
+            None,
+            None,
+        );
+
+        assert_eq!(open_ai_request.messages.len(), 2);
+
+        assert!(
+            matches!(
+                &open_ai_request.messages[1],
+                crate::RequestMessage::Assistant {
+                    content: Some(crate::MessageContent::Plain(text)),
+                    tool_calls,
+                    reasoning_content: None,
+                } if text == "Hi there!" && tool_calls.is_empty()
+            )
+        );
+    }
+
+    #[test]
+    fn into_open_ai_thinking_before_tool_use_on_same_message() {
+        let tool_use = LanguageModelToolUse {
+            id: LanguageModelToolUseId::from("call-99"),
+            name: Arc::from("search"),
+            raw_input: "{\"query\":\"rust\"}".into(),
+            input: json!({ "query": "rust" }),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+
+        let request = LanguageModelRequest {
+            thread_id: None,
+            prompt_id: None,
+            intent: None,
+            messages: vec![
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text("Search for rust".into())],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::Assistant,
+                    content: vec![
+                        MessageContent::Thinking {
+                            text: "I should search.".into(),
+                            signature: None,
+                        },
+                        MessageContent::ToolUse(tool_use),
+                    ],
+                    cache: false,
+                    reasoning_details: None,
+                },
+            ],
+            tools: vec![],
+            tool_choice: None,
+            stop: vec![],
+            temperature: None,
+            thinking_allowed: true,
+            thinking_effort: None,
+            speed: None,
+        };
+
+        let open_ai_request = into_open_ai(
+            request,
+            "kimi-k2.5",
+            false,
+            false,
+            None,
+            None,
+        );
+
+        assert_eq!(open_ai_request.messages.len(), 2);
+
+        assert!(
+            matches!(&open_ai_request.messages[0], crate::RequestMessage::User { .. })
+        );
+
+        assert!(
+            matches!(
+                &open_ai_request.messages[1],
+                crate::RequestMessage::Assistant {
+                    content: None,
+                    tool_calls,
+                    reasoning_content: Some(reasoning),
+                } if tool_calls.len() == 1 && reasoning == "I should search."
+            )
         );
     }
 }
