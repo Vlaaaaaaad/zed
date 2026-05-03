@@ -168,6 +168,7 @@ pub enum Model {
         protocol: ApiProtocol,
         reasoning_effort_levels: Option<Vec<ReasoningEffort>>,
         custom_model_api_url: Option<String>,
+        interleaved_reasoning: bool,
     },
 }
 
@@ -404,6 +405,26 @@ impl Model {
             | Self::Hy3PreviewFree => ApiProtocol::OpenAiChat,
 
             Self::Custom { protocol, .. } => *protocol,
+        }
+    }
+
+    pub fn interleaved_reasoning(&self) -> bool {
+        match self {
+            Self::DeepSeekV4Flash
+            | Self::DeepSeekV4Pro
+            | Self::KimiK2_5
+            | Self::KimiK2_6
+            | Self::MimoV2Omni
+            | Self::MimoV2_5
+            | Self::MimoV2_5Pro
+            | Self::Glm5
+            | Self::Glm5_1 => true,
+
+            Self::Custom {
+                interleaved_reasoning, ..
+            } => *interleaved_reasoning,
+
+            _ => false,
         }
     }
 
