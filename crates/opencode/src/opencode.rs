@@ -385,7 +385,7 @@ impl Model {
 
             Self::Gemini3_1Pro | Self::Gemini3Flash => ApiProtocol::Google,
 
-            Self::DeepSeekV4Pro | Self::DeepSeekV4Flash => ApiProtocol::Anthropic,
+            Self::DeepSeekV4Pro | Self::DeepSeekV4Flash => ApiProtocol::OpenAiChat,
 
             Self::MiniMaxM2_5Free
             | Self::Glm5
@@ -487,7 +487,7 @@ impl Model {
             // Google models
             Self::Gemini3_1Pro | Self::Gemini3Flash => Some(65_536),
 
-            // Anthropic-compatible models
+            // DeepSeek models
             Self::DeepSeekV4Pro | Self::DeepSeekV4Flash => Some(384_000),
 
             // OpenAI-compatible models
@@ -570,7 +570,7 @@ impl Model {
             | Self::Ling2_6FlashFree
             | Self::Hy3PreviewFree => false,
 
-            // DeepSeek models (Anthropic protocol) don't support images
+            // DeepSeek models don't support images
             Self::DeepSeekV4Pro | Self::DeepSeekV4Flash => false,
 
             Self::Custom { protocol, .. } => matches!(
