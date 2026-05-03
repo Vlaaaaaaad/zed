@@ -421,7 +421,8 @@ impl Model {
             | Self::Glm5_1 => true,
 
             Self::Custom {
-                interleaved_reasoning, ..
+                interleaved_reasoning,
+                ..
             } => *interleaved_reasoning,
 
             _ => false,
