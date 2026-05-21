@@ -9,6 +9,7 @@ use http_client::{
     http::{HeaderMap, HeaderValue},
 };
 pub use language_model_core::ReasoningEffort;
+use language_model_core::{ServiceTierInfo, SharedString};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{convert::TryFrom, future::Future};
@@ -342,6 +343,36 @@ impl Model {
     pub fn supports_prompt_cache_key(&self) -> bool {
         true
     }
+
+    pub fn supported_service_tiers(&self) -> Vec<ServiceTierInfo> {
+        vec![
+            ServiceTierInfo {
+                name: SharedString::new_static("Auto"),
+                value: SharedString::new_static("auto"),
+                is_default: true,
+            },
+            ServiceTierInfo {
+                name: SharedString::new_static("Default"),
+                value: SharedString::new_static("default"),
+                is_default: false,
+            },
+            ServiceTierInfo {
+                name: SharedString::new_static("Flex"),
+                value: SharedString::new_static("flex"),
+                is_default: false,
+            },
+            ServiceTierInfo {
+                name: SharedString::new_static("Priority"),
+                value: SharedString::new_static("priority"),
+                is_default: false,
+            },
+            ServiceTierInfo {
+                name: SharedString::new_static("Scale"),
+                value: SharedString::new_static("scale"),
+                is_default: false,
+            },
+        ]
+    }
 }
 
 #[cfg(test)]
@@ -456,6 +487,8 @@ pub struct Request {
     pub prompt_cache_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

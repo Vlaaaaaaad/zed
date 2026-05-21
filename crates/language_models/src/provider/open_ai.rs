@@ -9,7 +9,7 @@ use language_model::{
     LanguageModelCompletionEvent, LanguageModelEffortLevel, LanguageModelId, LanguageModelName,
     LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
     LanguageModelProviderState, LanguageModelRequest, LanguageModelToolChoice, OPEN_AI_PROVIDER_ID,
-    OPEN_AI_PROVIDER_NAME, RateLimiter, env_var,
+    OPEN_AI_PROVIDER_NAME, RateLimiter, ServiceTierInfo, env_var,
 };
 use menu;
 use open_ai::{
@@ -456,6 +456,10 @@ impl LanguageModel for OpenAiLanguageModel {
 
     fn supported_effort_levels(&self) -> Vec<LanguageModelEffortLevel> {
         supported_thinking_effort_levels(&self.model)
+    }
+
+    fn supported_service_tiers(&self) -> Vec<ServiceTierInfo> {
+        self.model.supported_service_tiers()
     }
 
     fn supports_split_token_display(&self) -> bool {

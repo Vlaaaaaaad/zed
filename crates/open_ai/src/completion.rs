@@ -173,6 +173,7 @@ pub fn into_open_ai(
             LanguageModelToolChoice::None => crate::ToolChoice::None,
         }),
         reasoning_effort,
+        service_tier: request.service_tier,
     }
 }
 
@@ -198,7 +199,7 @@ pub fn into_open_ai_response(
         temperature,
         thinking_allowed,
         thinking_effort,
-        service_tier: _,
+        service_tier,
         speed: _,
     } = request;
 
@@ -285,6 +286,7 @@ pub fn into_open_ai_response(
             None
         },
         reasoning,
+        service_tier,
     }
 }
 
