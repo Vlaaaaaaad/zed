@@ -3544,6 +3544,7 @@ impl AgentPanel {
                                 model,
                                 enable_thinking,
                                 effort,
+                                service_tier: None,
                                 speed: None,
                             })
                     });
@@ -9522,6 +9523,7 @@ mod tests {
             speed: None,
             thinking_enabled: false,
             thinking_effort: None,
+            service_tier: None,
             draft_prompt: None,
             ui_scroll_position: None,
         };

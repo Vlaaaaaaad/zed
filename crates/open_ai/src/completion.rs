@@ -198,6 +198,7 @@ pub fn into_open_ai_response(
         temperature,
         thinking_allowed,
         thinking_effort,
+        service_tier: _,
         speed: _,
     } = request;
 
@@ -1390,6 +1391,7 @@ mod tests {
             temperature: None,
             thinking_allowed: true,
             thinking_effort: Some("high".into()),
+            service_tier: None,
             speed: None,
         };
 
@@ -1511,6 +1513,7 @@ mod tests {
             temperature: None,
             thinking_allowed: false,
             thinking_effort: None,
+            service_tier: None,
             speed: None,
         };
 
@@ -1593,6 +1596,7 @@ mod tests {
             temperature: None,
             thinking_allowed: false,
             thinking_effort: None,
+            service_tier: None,
             speed: None,
         };
 
@@ -1649,6 +1653,7 @@ mod tests {
             temperature: None,
             thinking_allowed: false,
             thinking_effort: Some("high".into()),
+            service_tier: None,
             speed: None,
         };
 
@@ -1684,6 +1689,7 @@ mod tests {
             temperature: None,
             thinking_allowed: false,
             thinking_effort: Some("high".into()),
+            service_tier: None,
             speed: None,
         };
 
@@ -1722,6 +1728,7 @@ mod tests {
             temperature: None,
             thinking_allowed: true,
             thinking_effort: Some("none".into()),
+            service_tier: None,
             speed: None,
         };
 
@@ -1772,6 +1779,7 @@ mod tests {
             temperature: None,
             thinking_allowed: true,
             thinking_effort: None,
+            service_tier: None,
             speed: None,
         };
 
@@ -1861,6 +1869,7 @@ mod tests {
             temperature: None,
             thinking_allowed: true,
             thinking_effort: None,
+            service_tier: None,
             speed: None,
         };
 
@@ -1948,6 +1957,7 @@ mod tests {
             temperature: None,
             thinking_allowed: false,
             thinking_effort: None,
+            service_tier: None,
             speed: None,
         };
 
@@ -2976,6 +2986,7 @@ mod tests {
             temperature: None,
             thinking_allowed: true,
             thinking_effort: None,
+            service_tier: None,
             speed: None,
         };
 

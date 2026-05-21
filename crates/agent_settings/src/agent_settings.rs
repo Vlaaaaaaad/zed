@@ -237,7 +237,20 @@ pub fn language_model_to_selection(
                         .default_effort_level()
                         .map(|effort| effort.value.to_string())
                 }),
-            speed: current.speed.filter(|_| model.supports_fast_mode()),
+service_tier: current
+                .service_tier
+                .clone()
+                .filter(|value| {
+                    model
+                        .supported_service_tiers()
+                        .iter()
+                        .any(|tier| tier.value.as_ref() == value.as_str())
+                })
+                .or_else(|| {
+                    model
+                        .default_service_tier()
+                        .map(|tier| tier.value.to_string())
+                }),
         },
         None => LanguageModelSelection {
             provider,
@@ -246,7 +259,9 @@ pub fn language_model_to_selection(
             effort: model
                 .default_effort_level()
                 .map(|effort| effort.value.to_string()),
-            speed: None,
+            service_tier: model
+                .default_service_tier()
+                .map(|tier| tier.value.to_string()),
         },
     }
 }

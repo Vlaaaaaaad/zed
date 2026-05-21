@@ -236,6 +236,7 @@ impl AgentSettingsContent {
             model,
             enable_thinking: false,
             effort: None,
+            service_tier: None,
             speed: None,
         });
     }
@@ -395,6 +396,7 @@ pub struct LanguageModelSelection {
     #[serde(default)]
     pub enable_thinking: bool,
     pub effort: Option<String>,
+    pub service_tier: Option<String>,
     pub speed: Option<language_model_core::Speed>,
 }
 
