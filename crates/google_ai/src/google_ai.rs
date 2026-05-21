@@ -4,6 +4,7 @@ use anyhow::{Result, anyhow, bail};
 use futures::{AsyncBufReadExt, AsyncReadExt, StreamExt, io::BufReader, stream::BoxStream};
 use http_client::{AsyncBody, HttpClient, Method, Request as HttpRequest};
 pub use language_model_core::ModelMode as GoogleModelMode;
+use language_model_core::{ServiceTierInfo, SharedString};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub mod completion;
 
@@ -113,6 +114,8 @@ pub struct GenerateContentRequest {
     pub tools: Option<Vec<Tool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_config: Option<ToolConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -672,6 +675,26 @@ impl Model {
             },
             Self::Custom { mode, .. } => *mode,
         }
+    }
+
+    pub fn supported_service_tiers(&self) -> Vec<ServiceTierInfo> {
+        vec![
+            ServiceTierInfo {
+                name: SharedString::new_static("Standard"),
+                value: SharedString::new_static("standard"),
+                is_default: true,
+            },
+            ServiceTierInfo {
+                name: SharedString::new_static("Flex"),
+                value: SharedString::new_static("flex"),
+                is_default: false,
+            },
+            ServiceTierInfo {
+                name: SharedString::new_static("Priority"),
+                value: SharedString::new_static("priority"),
+                is_default: false,
+            },
+        ]
     }
 }
 

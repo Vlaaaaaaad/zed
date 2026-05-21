@@ -185,6 +185,7 @@ pub fn into_google(
                 allowed_function_names: None,
             },
         }),
+        service_tier: request.service_tier,
     }
 }
 

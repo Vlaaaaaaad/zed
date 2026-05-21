@@ -14,6 +14,7 @@ use language_model::{
     GOOGLE_PROVIDER_ID, GOOGLE_PROVIDER_NAME, IconOrSvg, LanguageModel, LanguageModelEffortLevel,
     LanguageModelId, LanguageModelName, LanguageModelProvider, LanguageModelProviderId,
     LanguageModelProviderName, LanguageModelProviderState, LanguageModelRequest, RateLimiter,
+    ServiceTierInfo,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -314,6 +315,10 @@ impl LanguageModel for GoogleLanguageModel {
                 is_default: Some(*level) == default_level,
             })
             .collect()
+    }
+
+    fn supported_service_tiers(&self) -> Vec<ServiceTierInfo> {
+        self.model.supported_service_tiers()
     }
 
     fn supports_tool_choice(&self, choice: LanguageModelToolChoice) -> bool {
