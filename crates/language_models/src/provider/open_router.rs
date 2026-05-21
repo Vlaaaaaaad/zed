@@ -10,7 +10,7 @@ use language_model::{
     LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
     LanguageModelRequest, LanguageModelToolChoice, LanguageModelToolResultContent,
     LanguageModelToolSchemaFormat, LanguageModelToolUse, MessageContent, RateLimiter, Role,
-    StopReason, TokenUsage, env_var,
+    ServiceTierInfo, StopReason, TokenUsage, env_var,
 };
 use open_router::{
     Model, ModelMode as OpenRouterModelMode, OPEN_ROUTER_API_URL, ResponseStreamEvent, list_models,
@@ -372,6 +372,10 @@ impl LanguageModel for OpenRouterLanguageModel {
         self.model.supports_images.unwrap_or(false)
     }
 
+    fn supported_service_tiers(&self) -> Vec<ServiceTierInfo> {
+        self.model.supported_service_tiers()
+    }
+
     fn stream_completion(
         &self,
         request: LanguageModelRequest,
@@ -533,6 +537,7 @@ pub fn into_open_router(
             LanguageModelToolChoice::None => open_router::ToolChoice::None,
         }),
         provider: model.provider.clone(),
+        service_tier: request.service_tier.filter(|tier| tier != "default"),
     }
 }
 

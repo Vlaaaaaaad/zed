@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use futures::{AsyncBufReadExt, AsyncReadExt, StreamExt, io::BufReader, stream::BoxStream};
 use http_client::{AsyncBody, HttpClient, Method, Request as HttpRequest, http};
+use language_model_core::{ServiceTierInfo, SharedString};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 pub use settings::DataCollection;
@@ -137,6 +138,26 @@ impl Model {
     pub fn supports_parallel_tool_calls(&self) -> bool {
         false
     }
+
+    pub fn supported_service_tiers(&self) -> Vec<ServiceTierInfo> {
+        vec![
+            ServiceTierInfo {
+                name: SharedString::new_static("Default"),
+                value: SharedString::new_static("default"),
+                is_default: true,
+            },
+            ServiceTierInfo {
+                name: SharedString::new_static("Flex"),
+                value: SharedString::new_static("flex"),
+                is_default: false,
+            },
+            ServiceTierInfo {
+                name: SharedString::new_static("Priority"),
+                value: SharedString::new_static("priority"),
+                is_default: false,
+            },
+        ]
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -159,6 +180,8 @@ pub struct Request {
     pub reasoning: Option<Reasoning>,
     pub usage: RequestUsage,
     pub provider: Option<Provider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
