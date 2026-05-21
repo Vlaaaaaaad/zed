@@ -1161,7 +1161,7 @@ impl Thread {
         self.model = Some(model.clone());
         self.thinking_enabled = selection.enable_thinking && model.supports_thinking();
         self.thinking_effort = selection.effort.clone();
-self.service_tier = selection
+        self.service_tier = selection
             .service_tier
             .clone()
             .filter(|value| {

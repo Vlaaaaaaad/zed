@@ -237,7 +237,7 @@ pub fn language_model_to_selection(
                         .default_effort_level()
                         .map(|effort| effort.value.to_string())
                 }),
-service_tier: current
+            service_tier: current
                 .service_tier
                 .clone()
                 .filter(|value| {

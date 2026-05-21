@@ -87,10 +87,7 @@ pub async fn stream_completion(
             }
         };
         if let Some(tier_type) = tier_type {
-            if let Ok(service_tier) = BedrockServiceTier::builder()
-                .r#type(tier_type)
-                .build()
-            {
+            if let Ok(service_tier) = BedrockServiceTier::builder().r#type(tier_type).build() {
                 response = response.service_tier(service_tier);
             }
         }
