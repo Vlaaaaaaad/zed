@@ -4924,6 +4924,38 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_set_service_tier_propagates_to_subagents(cx: &mut TestAppContext) {
+        let (parent, _event_stream) = setup_thread_for_test(cx).await;
+        let subagents = setup_parent_with_subagents(cx, &parent, 2);
+
+        cx.update(|cx| {
+            parent.update(cx, |thread, cx| {
+                thread.set_service_tier(Some("priority".to_string()), cx);
+            });
+
+            for subagent in &subagents {
+                assert_eq!(
+                    subagent.read(cx).service_tier().map(|s| s.as_str()),
+                    Some("priority"),
+                    "Subagent service tier should match parent after set_service_tier"
+                );
+            }
+
+            parent.update(cx, |thread, cx| {
+                thread.set_service_tier(None, cx);
+            });
+
+            for subagent in &subagents {
+                assert_eq!(
+                    subagent.read(cx).service_tier(),
+                    None,
+                    "Subagent service tier should be None after parent clears it"
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
     async fn test_subagent_inherits_settings_at_creation(cx: &mut TestAppContext) {
         let (parent, _event_stream) = setup_thread_for_test(cx).await;
 
@@ -4931,6 +4963,7 @@ mod tests {
             parent.update(cx, |thread, cx| {
                 thread.set_thinking_enabled(true, cx);
                 thread.set_thinking_effort(Some("high".to_string()), cx);
+                thread.set_service_tier(Some("flex".to_string()), cx);
                 thread.set_profile(AgentProfileId("custom-profile".into()), cx);
             });
         });
@@ -4941,6 +4974,11 @@ mod tests {
             let sub = subagents[0].read(cx);
             assert!(sub.thinking_enabled());
             assert_eq!(sub.thinking_effort().map(|s| s.as_str()), Some("high"));
+            assert_eq!(
+                sub.service_tier().map(|s| s.as_str()),
+                Some("flex"),
+                "Subagent should inherit service tier at creation"
+            );
             assert_eq!(sub.profile(), &AgentProfileId("custom-profile".into()));
         });
     }
