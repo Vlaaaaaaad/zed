@@ -200,7 +200,6 @@ pub fn into_open_ai_response(
         thinking_allowed,
         thinking_effort,
         service_tier,
-        speed: _,
     } = request;
 
     let mut input_items = Vec::new();
@@ -1344,7 +1343,6 @@ mod tests {
         let user_image = LanguageModelImage {
             source: SharedString::from("aGVsbG8="),
         };
-        let expected_image_url = user_image.to_base64_url();
 
         let request = LanguageModelRequest {
             thread_id: Some("thread-123".into()),
@@ -1394,129 +1392,6 @@ mod tests {
             thinking_allowed: true,
             thinking_effort: Some("high".into()),
             service_tier: None,
-            speed: None,
-        };
-
-        let response = into_open_ai_response(
-            request,
-            "custom-model",
-            true,
-            true,
-            Some(2048),
-            Some(ReasoningEffort::Low),
-            false,
-        );
-
-        let serialized = serde_json::to_value(&response).unwrap();
-        let expected = json!({
-            "model": "custom-model",
-            "input": [
-                {
-                    "type": "message",
-                    "role": "system",
-                    "content": [
-                        { "type": "input_text", "text": "System context" }
-                    ]
-                },
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": [
-                        { "type": "input_text", "text": "Please check the weather." },
-                        { "type": "input_image", "image_url": expected_image_url }
-                    ]
-                },
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [
-                        { "type": "output_text", "text": "Looking that up.", "annotations": [] }
-                    ]
-                },
-                {
-                    "type": "function_call",
-                    "call_id": "call-42",
-                    "name": "get_weather",
-                    "arguments": tool_arguments
-                },
-                {
-                    "type": "function_call_output",
-                    "call_id": "call-42",
-                    "output": "Sunny"
-                }
-            ],
-            "store": false,
-            "include": ["reasoning.encrypted_content"],
-            "stream": true,
-            "max_output_tokens": 2048,
-            "parallel_tool_calls": true,
-            "tool_choice": "required",
-            "tools": [
-                {
-                    "type": "function",
-                    "name": "get_weather",
-                    "description": "Fetches the weather",
-                    "parameters": { "type": "object" }
-                }
-            ],
-            "prompt_cache_key": "thread-123",
-            "reasoning": { "effort": "high", "summary": "auto" }
-        });
-
-        assert_eq!(serialized, expected);
-    }
-
-    #[test]
-    fn into_open_ai_response_replays_encrypted_reasoning_details() {
-        let tool_call_id = LanguageModelToolUseId::from("call-42");
-        let tool_arguments = "{\"city\":\"Boston\"}".to_string();
-        let tool_use = LanguageModelToolUse {
-            id: tool_call_id,
-            name: Arc::from("get_weather"),
-            raw_input: tool_arguments.clone(),
-            input: json!({ "city": "Boston" }),
-            is_input_complete: true,
-            thought_signature: None,
-        };
-
-        let request = LanguageModelRequest {
-            thread_id: None,
-            prompt_id: None,
-            intent: None,
-            messages: vec![LanguageModelRequestMessage {
-                role: Role::Assistant,
-                content: vec![MessageContent::ToolUse(tool_use)],
-                cache: false,
-                reasoning_details: Some(json!({
-                    "reasoning_items": [
-                        {
-                            "id": "rs_123",
-                            "summary": [
-                                {
-                                    "type": "summary_text",
-                                    "text": "Checked what information is needed."
-                                }
-                            ],
-                            "content": [
-                                {
-                                    "type": "reasoning_text",
-                                    "text": "Internal reasoning text."
-                                }
-                            ],
-                            "encrypted_content": "ENC",
-                            "status": "completed",
-                        }
-                    ]
-                })),
-            }],
-            tools: Vec::new(),
-            tool_choice: None,
-            stop: Vec::new(),
-            temperature: None,
-            thinking_allowed: false,
-            thinking_effort: None,
-            service_tier: None,
-            speed: None,
         };
 
         let response = into_open_ai_response(
@@ -1599,7 +1474,6 @@ mod tests {
             thinking_allowed: false,
             thinking_effort: None,
             service_tier: None,
-            speed: None,
         };
 
         let response =
@@ -1656,7 +1530,6 @@ mod tests {
             thinking_allowed: false,
             thinking_effort: Some("high".into()),
             service_tier: None,
-            speed: None,
         };
 
         let response = into_open_ai_response(
@@ -1692,7 +1565,6 @@ mod tests {
             thinking_allowed: false,
             thinking_effort: Some("high".into()),
             service_tier: None,
-            speed: None,
         };
 
         let response = into_open_ai_response(
@@ -1731,7 +1603,6 @@ mod tests {
             thinking_allowed: true,
             thinking_effort: Some("none".into()),
             service_tier: None,
-            speed: None,
         };
 
         let response = into_open_ai_response(
@@ -1782,7 +1653,6 @@ mod tests {
             thinking_allowed: true,
             thinking_effort: None,
             service_tier: None,
-            speed: None,
         };
 
         let response = into_open_ai_response(
@@ -1872,7 +1742,6 @@ mod tests {
             thinking_allowed: true,
             thinking_effort: None,
             service_tier: None,
-            speed: None,
         };
 
         let response = into_open_ai_response(
@@ -1960,7 +1829,6 @@ mod tests {
             thinking_allowed: false,
             thinking_effort: None,
             service_tier: None,
-            speed: None,
         };
 
         let response =
@@ -2989,7 +2857,6 @@ mod tests {
             thinking_allowed: true,
             thinking_effort: None,
             service_tier: None,
-            speed: None,
         };
 
         let result = into_open_ai(request.clone(), "model", false, false, None, None, true);

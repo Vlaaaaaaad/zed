@@ -228,8 +228,6 @@ actions!(
         CycleServiceTier,
         /// Toggles the service tier selector menu open or closed.
         ToggleServiceTierMenu,
-        /// Toggles fast mode for models that support it.
-        ToggleFastMode,
         /// Scroll the output by one page up.
         ScrollOutputPageUp,
         /// Scroll the output by one page down.

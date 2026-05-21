@@ -430,8 +430,8 @@ impl LanguageModel for AnthropicModel {
         self.model.supports_thinking
     }
 
-    fn supports_fast_mode(&self) -> bool {
-        self.model.supports_speed
+    fn supported_service_tiers(&self) -> Vec<language_model::ServiceTierInfo> {
+        self.model.supported_service_tiers()
     }
 
     fn supported_effort_levels(&self) -> Vec<language_model::LanguageModelEffortLevel> {
@@ -488,7 +488,7 @@ impl LanguageModel for AnthropicModel {
     > {
         let has_tools = !request.tools.is_empty();
         let request_id = self.model.request_id(has_tools).to_string();
-        let mut request = into_anthropic(
+        let request = into_anthropic(
             request,
             request_id,
             self.model.default_temperature,
@@ -496,9 +496,6 @@ impl LanguageModel for AnthropicModel {
             self.model.mode.clone(),
             AnthropicPromptCacheMode::Automatic,
         );
-        if !self.model.supports_speed {
-            request.speed = None;
-        }
         let request = self.stream_completion(request, cx);
         let future = self.request_limiter.stream(async move {
             let response = request.await?;

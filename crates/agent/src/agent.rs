@@ -2057,7 +2057,6 @@ impl acp_thread::AgentModelSelector for NativeAgentModelSelector {
         let LanguageModelSelection {
             enable_thinking,
             effort,
-            speed,
             service_tier,
             ..
         } = agent_settings::language_model_to_selection(&model, favorite.as_ref());
@@ -2067,9 +2066,6 @@ impl acp_thread::AgentModelSelector for NativeAgentModelSelector {
             thread.set_thinking_effort(effort.clone(), cx);
             thread.set_service_tier(service_tier.clone(), cx);
             thread.set_thinking_enabled(enable_thinking, cx);
-            if let Some(speed) = speed {
-                thread.set_speed(speed, cx);
-            }
         });
 
         update_settings_file(
@@ -2079,7 +2075,6 @@ impl acp_thread::AgentModelSelector for NativeAgentModelSelector {
                 let provider = model.provider_id().0.to_string();
                 let model = model.id().0.to_string();
                 let enable_thinking = thread.read(cx).thinking_enabled();
-                let speed = thread.read(cx).speed();
                 settings
                     .agent
                     .get_or_insert_default()
@@ -2089,7 +2084,6 @@ impl acp_thread::AgentModelSelector for NativeAgentModelSelector {
                         enable_thinking,
                         effort,
                         service_tier,
-                        speed,
                     });
             },
         );

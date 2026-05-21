@@ -549,7 +549,6 @@ impl CodegenAlternative {
                 thinking_allowed: false,
                 thinking_effort: None,
                 service_tier: None,
-                speed: None,
             }
         }))
     }
@@ -630,7 +629,6 @@ impl CodegenAlternative {
                 thinking_allowed: false,
                 thinking_effort: None,
                 service_tier: None,
-                speed: None,
             }
         }))
     }

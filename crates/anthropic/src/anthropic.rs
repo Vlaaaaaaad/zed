@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use futures::{AsyncBufReadExt, AsyncReadExt, StreamExt, io::BufReader, stream::BoxStream};
 use http_client::http::{self, HeaderMap, HeaderValue};
 use http_client::{AsyncBody, HttpClient, Method, Request as HttpRequest, StatusCode};
+use language_model_core::SharedString;
 use serde::{Deserialize, Serialize};
 use strum::EnumString;
 use thiserror::Error;
@@ -97,6 +98,24 @@ pub struct Model {
 }
 
 impl Model {
+    pub fn supported_service_tiers(&self) -> Vec<language_model_core::ServiceTierInfo> {
+        if !self.supports_speed {
+            return Vec::new();
+        }
+        vec![
+            language_model_core::ServiceTierInfo {
+                name: SharedString::new_static("Standard"),
+                value: SharedString::new_static("standard"),
+                is_default: true,
+            },
+            language_model_core::ServiceTierInfo {
+                name: SharedString::new_static("Priority"),
+                value: SharedString::new_static("priority"),
+                is_default: false,
+            },
+        ]
+    }
+
     /// Construct a `Model` from an entry returned by the `/v1/models` listing endpoint.
     pub fn from_listed(entry: ListModelEntry) -> Self {
         let supports_thinking = entry
@@ -903,15 +922,6 @@ pub fn parse_prompt_too_long(message: &str) -> Option<u64> {
 }
 
 // -- Conversions from/to `language_model_core` types --
-
-impl From<language_model_core::Speed> for Speed {
-    fn from(speed: language_model_core::Speed) -> Self {
-        match speed {
-            language_model_core::Speed::Standard => Speed::Standard,
-            language_model_core::Speed::Fast => Speed::Fast,
-        }
-    }
-}
 
 impl From<AnthropicError> for language_model_core::LanguageModelCompletionError {
     fn from(error: AnthropicError) -> Self {

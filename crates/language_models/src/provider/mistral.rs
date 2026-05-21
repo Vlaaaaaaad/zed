@@ -982,7 +982,6 @@ mod tests {
             thinking_allowed: true,
             thinking_effort: None,
             service_tier: None,
-            speed: Default::default(),
         };
 
         let (mistral_request, affinity) =
@@ -1019,7 +1018,6 @@ mod tests {
             thinking_allowed: true,
             thinking_effort: None,
             service_tier: None,
-            speed: None,
         };
 
         let (mistral_request, _) = into_mistral(request, mistral::Model::MistralSmallLatest, None);

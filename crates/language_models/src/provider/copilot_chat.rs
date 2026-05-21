@@ -1213,7 +1213,6 @@ fn into_copilot_responses(
         thinking_allowed,
         thinking_effort,
         service_tier: _,
-        speed: _,
     } = request;
 
     let mut input_items: Vec<responses::ResponseInputItem> = Vec::new();

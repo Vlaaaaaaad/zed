@@ -76,10 +76,6 @@ pub trait LanguageModel: Send + Sync {
         false
     }
 
-    fn supports_fast_mode(&self) -> bool {
-        false
-    }
-
     /// Returns the list of supported effort levels that can be used when thinking.
     fn supported_effort_levels(&self) -> Vec<LanguageModelEffortLevel> {
         Vec::new()

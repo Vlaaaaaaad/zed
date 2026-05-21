@@ -375,6 +375,8 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
             LanguageModelCompletionError,
         >,
     > {
+        let mut request = request;
+        request.service_tier = None;
         if self.model.capabilities.chat_completions {
             let request = into_open_ai(
                 request,

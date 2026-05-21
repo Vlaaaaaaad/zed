@@ -8,7 +8,6 @@ use collections::{HashMap, IndexMap};
 use futures::{FutureExt, future::Shared};
 use gpui::{BackgroundExecutor, Global, Task};
 use indoc::indoc;
-use language_model::Speed;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sqlez::{
@@ -71,9 +70,6 @@ pub struct DbThread {
     pub imported: bool,
     #[serde(default)]
     pub subagent_context: Option<crate::SubagentContext>,
-    #[serde(default)]
-    pub speed: Option<Speed>,
-    #[serde(default)]
     pub thinking_enabled: bool,
     #[serde(default)]
     pub thinking_effort: Option<String>,
@@ -127,7 +123,6 @@ impl SharedThread {
             profile: None,
             imported: true,
             subagent_context: None,
-            speed: None,
             thinking_enabled: false,
             thinking_effort: None,
             service_tier: None,
@@ -307,7 +302,6 @@ impl DbThread {
             profile: thread.profile,
             imported: false,
             subagent_context: None,
-            speed: None,
             thinking_enabled: false,
             thinking_effort: None,
             service_tier: None,
@@ -693,7 +687,6 @@ mod tests {
             profile: None,
             imported: false,
             subagent_context: None,
-            speed: None,
             thinking_enabled: false,
             thinking_effort: None,
             service_tier: None,

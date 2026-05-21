@@ -311,7 +311,10 @@ pub fn into_anthropic(
             None
         },
         stop_sequences: Vec::new(),
-        speed: request.speed.map(Into::into),
+        speed: match request.service_tier.as_deref() {
+            Some("priority") => Some(crate::Speed::Fast),
+            _ => None,
+        },
         temperature: request.temperature.or(Some(default_temperature)),
         top_k: None,
         top_p: None,
@@ -563,7 +566,6 @@ mod tests {
             thinking_allowed: true,
             thinking_effort: None,
             service_tier: None,
-            speed: None,
         };
 
         let anthropic_request = into_anthropic(
@@ -668,7 +670,6 @@ mod tests {
             thinking_allowed: true,
             thinking_effort: None,
             service_tier: None,
-            speed: None,
         };
 
         let anthropic_request = into_anthropic(
@@ -739,7 +740,6 @@ mod tests {
             thinking_allowed: true,
             thinking_effort: None,
             service_tier: None,
-            speed: None,
         };
 
         let anthropic_request = into_anthropic(
@@ -777,7 +777,6 @@ mod tests {
             tool_choice: None,
             thinking_allowed: true,
             service_tier: None,
-            speed: None,
         };
         request.messages.push(LanguageModelRequestMessage {
             role: Role::Assistant,

@@ -635,6 +635,9 @@ impl LanguageModel for OpenCodeLanguageModel {
             self.http_client.clone()
         };
 
+        let mut request = request;
+        request.service_tier = None;
+
         match self.model.protocol(self.subscription) {
             ApiProtocol::Anthropic => {
                 let mode = if self.supports_thinking() && request.thinking_allowed {

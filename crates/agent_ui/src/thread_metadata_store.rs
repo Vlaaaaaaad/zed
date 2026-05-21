@@ -1826,7 +1826,6 @@ mod tests {
             profile: None,
             imported: false,
             subagent_context: None,
-            speed: None,
             thinking_enabled: false,
             thinking_effort: None,
             service_tier: None,

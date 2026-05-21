@@ -457,6 +457,7 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
                 .supported_reasoning_efforts()
                 .contains(&ReasoningEffort::None),
         );
+        responses_request.service_tier = None;
         responses_request.store = Some(false);
 
         // The Codex backend requires system messages to be in the top-level

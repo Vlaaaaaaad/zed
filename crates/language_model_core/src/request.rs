@@ -370,26 +370,6 @@ pub struct LanguageModelRequest {
     pub thinking_allowed: bool,
     pub thinking_effort: Option<String>,
     pub service_tier: Option<String>,
-    pub speed: Option<Speed>,
-}
-
-#[derive(
-    Clone, Copy, Default, Debug, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum Speed {
-    #[default]
-    Standard,
-    Fast,
-}
-
-impl Speed {
-    pub fn toggle(self) -> Self {
-        match self {
-            Speed::Standard => Speed::Fast,
-            Speed::Fast => Speed::Standard,
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]

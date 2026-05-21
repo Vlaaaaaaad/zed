@@ -329,6 +329,8 @@ impl LanguageModel for XAiLanguageModel {
             LanguageModelCompletionError,
         >,
     > {
+        let mut request = request;
+        request.service_tier = None;
         let request = crate::provider::open_ai::into_open_ai(
             request,
             self.model.id(),

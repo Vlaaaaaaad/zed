@@ -40,8 +40,8 @@ use language_model::{
     LanguageModelId, LanguageModelImage, LanguageModelProviderId, LanguageModelRegistry,
     LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestTool,
     LanguageModelToolResult, LanguageModelToolResultContent, LanguageModelToolSchemaFormat,
-    LanguageModelToolUse, LanguageModelToolUseId, Role, SelectedModel, Speed, StopReason,
-    TokenUsage, ZED_CLOUD_PROVIDER_ID,
+    LanguageModelToolUse, LanguageModelToolUseId, Role, SelectedModel, StopReason, TokenUsage,
+    ZED_CLOUD_PROVIDER_ID,
 };
 use project::Project;
 use prompt_store::ProjectContext;
@@ -988,7 +988,6 @@ pub struct Thread {
     thinking_enabled: bool,
     thinking_effort: Option<String>,
     service_tier: Option<String>,
-    speed: Option<Speed>,
     prompt_capabilities_tx: watch::Sender<acp::PromptCapabilities>,
     pub(crate) prompt_capabilities_rx: watch::Receiver<acp::PromptCapabilities>,
     pub(crate) project: Entity<Project>,
@@ -1081,10 +1080,6 @@ impl Thread {
             .default_model
             .as_ref()
             .and_then(|model| model.effort.clone());
-        let speed = settings
-            .default_model
-            .as_ref()
-            .and_then(|model| model.speed);
         let service_tier = settings
             .default_model
             .as_ref()
@@ -1121,7 +1116,6 @@ impl Thread {
             model,
             summarization_model: None,
             thinking_enabled: enable_thinking,
-            speed,
             thinking_effort,
             service_tier,
             prompt_capabilities_tx,
@@ -1143,7 +1137,6 @@ impl Thread {
     /// should be inherited here as well.
     fn inherit_parent_settings(&mut self, parent_thread: &Entity<Thread>, cx: &mut Context<Self>) {
         let parent = parent_thread.read(cx);
-        self.speed = parent.speed;
         self.service_tier = parent.service_tier.clone();
         self.thinking_enabled = parent.thinking_enabled;
         self.thinking_effort = parent.thinking_effort.clone();
@@ -1452,7 +1445,6 @@ self.service_tier = selection
             thinking_enabled: db_thread.thinking_enabled,
             thinking_effort: db_thread.thinking_effort,
             service_tier: db_thread.service_tier,
-            speed: db_thread.speed,
             project,
             action_log,
             updated_at: db_thread.updated_at,
@@ -1487,7 +1479,6 @@ self.service_tier = selection
             profile: Some(self.profile_id.clone()),
             imported: self.imported,
             subagent_context: self.subagent_context.clone(),
-            speed: self.speed,
             thinking_enabled: self.thinking_enabled,
             thinking_effort: self.thinking_effort.clone(),
             service_tier: self.service_tier.clone(),
@@ -1634,25 +1625,6 @@ self.service_tier = selection
                 .update(cx, |thread, cx| {
                     if thread.inherits_parent_model_settings {
                         thread.set_thinking_effort(effort.clone(), cx)
-                    }
-                })
-                .ok();
-        }
-        cx.notify();
-    }
-
-    pub fn speed(&self) -> Option<Speed> {
-        self.speed
-    }
-
-    pub fn set_speed(&mut self, speed: Speed, cx: &mut Context<Self>) {
-        self.speed = Some(speed);
-
-        for subagent in &self.running_subagents {
-            subagent
-                .update(cx, |thread, cx| {
-                    if thread.inherits_parent_model_settings {
-                        thread.set_speed(speed, cx);
                     }
                 })
                 .ok();
@@ -3040,7 +3012,6 @@ self.service_tier = selection
             thinking_allowed: self.thinking_enabled,
             thinking_effort: self.thinking_effort.clone(),
             service_tier: self.service_tier().cloned(),
-            speed: self.speed(),
         };
 
         log::debug!("Completion request built successfully");
@@ -4958,7 +4929,6 @@ mod tests {
 
         cx.update(|cx| {
             parent.update(cx, |thread, cx| {
-                thread.set_speed(Speed::Fast, cx);
                 thread.set_thinking_enabled(true, cx);
                 thread.set_thinking_effort(Some("high".to_string()), cx);
                 thread.set_profile(AgentProfileId("custom-profile".into()), cx);
@@ -4969,30 +4939,9 @@ mod tests {
 
         cx.update(|cx| {
             let sub = subagents[0].read(cx);
-            assert_eq!(sub.speed(), Some(Speed::Fast));
             assert!(sub.thinking_enabled());
             assert_eq!(sub.thinking_effort().map(|s| s.as_str()), Some("high"));
             assert_eq!(sub.profile(), &AgentProfileId("custom-profile".into()));
-        });
-    }
-
-    #[gpui::test]
-    async fn test_set_speed_propagates_to_subagents(cx: &mut TestAppContext) {
-        let (parent, _event_stream) = setup_thread_for_test(cx).await;
-        let subagents = setup_parent_with_subagents(cx, &parent, 2);
-
-        cx.update(|cx| {
-            parent.update(cx, |thread, cx| {
-                thread.set_speed(Speed::Fast, cx);
-            });
-
-            for subagent in &subagents {
-                assert_eq!(
-                    subagent.read(cx).speed(),
-                    Some(Speed::Fast),
-                    "Subagent speed should match parent after set_speed"
-                );
-            }
         });
     }
 
@@ -5008,7 +4957,6 @@ mod tests {
         cx.update(|cx| {
             parent.update(cx, |thread, cx| {
                 thread.set_thinking_enabled(true, cx);
-                thread.set_speed(Speed::Fast, cx);
                 thread.set_thinking_effort(Some("high".to_string()), cx);
             });
         });

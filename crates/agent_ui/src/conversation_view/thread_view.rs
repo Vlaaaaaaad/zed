@@ -17,7 +17,7 @@ use crate::message_editor::SharedSessionCapabilities;
 use gpui::List;
 use gpui::TaskExt;
 use heapless::Vec as ArrayVec;
-use language_model::{LanguageModelEffortLevel, Speed};
+use language_model::LanguageModelEffortLevel;
 use settings::update_settings_file;
 use ui::{ButtonLike, SpinnerLabel, SpinnerVariant, SplitButton, SplitButtonStyle, Tab};
 use workspace::SERIALIZATION_THROTTLE_TIME;
@@ -3356,7 +3356,6 @@ impl ThreadView {
                                     .gap_0p5()
                                     .child(self.render_add_context_button(cx))
                                     .child(self.render_follow_toggle(cx))
-                                    .children(self.render_fast_mode_control(cx))
                                     .children(self.render_thinking_control(cx))
                                     .children(self.render_service_tier_control(cx)),
                             )
@@ -3758,49 +3757,6 @@ impl ThreadView {
                     .into_any_element(),
             )
         }
-    }
-
-    fn fast_mode_available(&self, cx: &Context<Self>) -> bool {
-        if !cx.is_staff() {
-            return false;
-        }
-        self.as_native_thread(cx)
-            .and_then(|thread| thread.read(cx).model())
-            .map(|model| model.supports_fast_mode())
-            .unwrap_or(false)
-    }
-
-    fn render_fast_mode_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.fast_mode_available(cx) {
-            return None;
-        }
-
-        let thread = self.as_native_thread(cx)?.read(cx);
-
-        let (tooltip_label, color, icon) = if matches!(thread.speed(), Some(Speed::Fast)) {
-            ("Disable Fast Mode", Color::Accent, IconName::FastForward)
-        } else {
-            (
-                "Enable Fast Mode",
-                Color::Custom(cx.theme().colors().icon_disabled.opacity(0.8)),
-                IconName::FastForwardOff,
-            )
-        };
-
-        let focus_handle = self.message_editor.focus_handle(cx);
-
-        Some(
-            IconButton::new("fast-mode", icon)
-                .icon_size(IconSize::Small)
-                .icon_color(color)
-                .tooltip(move |_, cx| {
-                    Tooltip::for_action_in(tooltip_label, &ToggleFastMode, &focus_handle, cx)
-                })
-                .on_click(cx.listener(move |this, _, _window, cx| {
-                    this.toggle_fast_mode(cx);
-                }))
-                .into_any_element(),
-        )
     }
 
     fn render_thinking_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -9175,39 +9131,6 @@ impl ThreadView {
         });
     }
 
-    fn toggle_fast_mode(&mut self, cx: &mut Context<Self>) {
-        if !self.fast_mode_available(cx) {
-            return;
-        }
-        let Some(thread) = self.as_native_thread(cx) else {
-            return;
-        };
-        thread.update(cx, |thread, cx| {
-            let new_speed = thread
-                .speed()
-                .map(|speed| speed.toggle())
-                .unwrap_or(Speed::Fast);
-            thread.set_speed(new_speed, cx);
-
-            let favorite_key = thread
-                .model()
-                .map(|model| (model.provider_id().0.to_string(), model.id().0.to_string()));
-            let fs = thread.project().read(cx).fs().clone();
-            update_settings_file(fs, cx, move |settings, _| {
-                if let Some(agent) = settings.agent.as_mut() {
-                    if let Some(default_model) = agent.default_model.as_mut() {
-                        default_model.speed = Some(new_speed);
-                    }
-                    if let Some((provider_id, model_id)) = &favorite_key {
-                        agent.update_favorite_model(provider_id, model_id, |favorite| {
-                            favorite.speed = Some(new_speed)
-                        });
-                    }
-                }
-            });
-        });
-    }
-
     fn cycle_thinking_effort(&mut self, cx: &mut Context<Self>) {
         let Some(thread) = self.as_native_thread(cx) else {
             return;
@@ -9392,9 +9315,6 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::scroll_output_to_bottom))
             .on_action(cx.listener(Self::scroll_output_to_previous_message))
             .on_action(cx.listener(Self::scroll_output_to_next_message))
-            .on_action(cx.listener(|this, _: &ToggleFastMode, _window, cx| {
-                this.toggle_fast_mode(cx);
-            }))
             .on_action(cx.listener(|this, _: &ToggleThinkingMode, _window, cx| {
                 if this.thread.read(cx).status() != ThreadStatus::Idle {
                     return;

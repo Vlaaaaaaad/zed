@@ -310,10 +310,6 @@ impl<TP: CloudLlmTokenProvider + 'static> LanguageModel for CloudLanguageModel<T
         self.model.supports_thinking
     }
 
-    fn supports_fast_mode(&self) -> bool {
-        self.model.supports_fast_mode
-    }
-
     fn supported_effort_levels(&self) -> Vec<LanguageModelEffortLevel> {
         self.model
             .supported_effort_levels
@@ -414,10 +410,6 @@ impl<TP: CloudLlmTokenProvider + 'static> LanguageModel for CloudLanguageModel<T
                     request.output_config = Some(anthropic::OutputConfig { effort });
                 }
 
-                if !self.model.supports_fast_mode {
-                    request.speed = None;
-                }
-
                 let http_client = self.http_client.clone();
                 let token_provider = self.token_provider.clone();
                 let auth_context = token_provider.auth_context(cx);
@@ -477,6 +469,7 @@ impl<TP: CloudLlmTokenProvider + 'static> LanguageModel for CloudLanguageModel<T
                     None,
                     supports_none_reasoning_effort,
                 );
+                request.service_tier = None;
 
                 if enable_thinking && let Some(effort) = effort {
                     request.reasoning = Some(open_ai::responses::ReasoningConfig {
@@ -518,7 +511,7 @@ impl<TP: CloudLlmTokenProvider + 'static> LanguageModel for CloudLanguageModel<T
             cloud_llm_client::LanguageModelProvider::XAi => {
                 let http_client = self.http_client.clone();
                 let token_provider = self.token_provider.clone();
-                let request = into_open_ai(
+                let mut request = into_open_ai(
                     request,
                     &self.model.id.0,
                     self.model.supports_parallel_tool_calls,
@@ -527,6 +520,7 @@ impl<TP: CloudLlmTokenProvider + 'static> LanguageModel for CloudLanguageModel<T
                     None,
                     false,
                 );
+                request.service_tier = None;
                 let auth_context = token_provider.auth_context(cx);
                 let future = self.request_limiter.stream(async move {
                     let PerformLlmCompletionResponse {
