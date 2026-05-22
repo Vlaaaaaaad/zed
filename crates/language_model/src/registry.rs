@@ -64,6 +64,7 @@ pub struct LanguageModelRegistry {
 pub struct SelectedModel {
     pub provider: LanguageModelProviderId,
     pub model: LanguageModelId,
+    pub service_tier: Option<String>,
 }
 
 impl FromStr for SelectedModel {
@@ -86,6 +87,7 @@ impl FromStr for SelectedModel {
         Ok(SelectedModel {
             provider: LanguageModelProviderId(provider_id.to_string().into()),
             model: LanguageModelId(model_id.to_string().into()),
+            service_tier: None,
         })
     }
 }
@@ -94,6 +96,7 @@ impl FromStr for SelectedModel {
 pub struct ConfiguredModel {
     pub provider: Arc<dyn LanguageModelProvider>,
     pub model: Arc<dyn LanguageModel>,
+    pub service_tier: Option<String>,
 }
 
 impl ConfiguredModel {
@@ -139,6 +142,7 @@ impl LanguageModelRegistry {
             let configured_model = ConfiguredModel {
                 provider: fake_provider.clone(),
                 model,
+                service_tier: None,
             };
             registry.set_default_model(Some(configured_model), cx);
             registry
@@ -346,7 +350,11 @@ impl LanguageModelRegistry {
             .iter()
             .find(|model| model.id() == selected_model.model)?
             .clone();
-        Some(ConfiguredModel { provider, model })
+        Some(ConfiguredModel {
+            provider,
+            model,
+            service_tier: selected_model.service_tier.clone(),
+        })
     }
 
     pub fn set_default_model(&mut self, model: Option<ConfiguredModel>, cx: &mut Context<Self>) {
@@ -427,8 +435,9 @@ impl LanguageModelRegistry {
         let configured = self.default_model()?;
         let fast_model = configured.provider.default_fast_model(cx)?;
         Some(ConfiguredModel {
-            provider: configured.provider,
+            provider: configured.provider.clone(),
             model: fast_model,
+            service_tier: configured.service_tier.clone(),
         })
     }
 
@@ -614,6 +623,7 @@ mod tests {
                 Some(ConfiguredModel {
                     provider: provider.clone(),
                     model: model.clone(),
+                    service_tier: None,
                 }),
                 cx,
             );

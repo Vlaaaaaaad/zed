@@ -173,6 +173,7 @@ impl BufferCodegen {
     pub fn start(
         &mut self,
         primary_model: Arc<dyn LanguageModel>,
+        service_tier: Option<String>,
         user_prompt: String,
         context_task: Shared<Task<Option<LoadedContext>>>,
         cx: &mut Context<Self>,
@@ -203,8 +204,15 @@ impl BufferCodegen {
             .chain(alternative_models)
             .zip(&self.alternatives)
         {
+            let service_tier = service_tier.clone();
             alternative.update(cx, |alternative, cx| {
-                alternative.start(user_prompt.clone(), context_task.clone(), model.clone(), cx)
+                alternative.start(
+                    user_prompt.clone(),
+                    context_task.clone(),
+                    model.clone(),
+                    service_tier,
+                    cx,
+                )
             })?;
         }
 
@@ -287,6 +295,7 @@ pub struct CodegenAlternative {
     session_id: Uuid,
     pub description: Option<String>,
     pub failure: Option<String>,
+    service_tier: Option<String>,
 }
 
 impl EventEmitter<CodegenEvent> for CodegenAlternative {}
@@ -347,6 +356,7 @@ impl CodegenAlternative {
             session_id,
             description: None,
             failure: None,
+            service_tier: None,
             _subscription: cx.subscribe(&buffer, Self::handle_buffer_event),
         }
     }
@@ -409,8 +419,11 @@ impl CodegenAlternative {
         user_prompt: String,
         context_task: Shared<Task<Option<LoadedContext>>>,
         model: Arc<dyn LanguageModel>,
+        service_tier: Option<String>,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        self.service_tier = service_tier;
+
         // Clear the model explanation since the user has started a new generation.
         self.description = None;
 
@@ -499,6 +512,8 @@ impl CodegenAlternative {
         let tool_choice = model
             .supports_tool_choice(LanguageModelToolChoice::Any)
             .then_some(LanguageModelToolChoice::Any);
+        let service_tier =
+            AgentSettings::service_tier_for_model(model, cx).or_else(|| self.service_tier.clone());
 
         Ok(cx.spawn(async move |_cx| {
             let mut messages = vec![LanguageModelRequestMessage {
@@ -548,7 +563,7 @@ impl CodegenAlternative {
                 messages,
                 thinking_allowed: false,
                 thinking_effort: None,
-                service_tier: None,
+                service_tier,
             }
         }))
     }
@@ -602,6 +617,8 @@ impl CodegenAlternative {
             .context("generating content prompt")?;
 
         let temperature = AgentSettings::temperature_for_model(model, cx);
+        let service_tier =
+            AgentSettings::service_tier_for_model(model, cx).or_else(|| self.service_tier.clone());
 
         Ok(cx.spawn(async move |_cx| {
             let mut request_message = LanguageModelRequestMessage {
@@ -628,7 +645,7 @@ impl CodegenAlternative {
                 messages: vec![request_message],
                 thinking_allowed: false,
                 thinking_effort: None,
-                service_tier: None,
+                service_tier,
             }
         }))
     }

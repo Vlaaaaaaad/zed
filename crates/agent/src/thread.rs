@@ -985,6 +985,7 @@ pub struct Thread {
     pub(crate) templates: Arc<Templates>,
     model: Option<Arc<dyn LanguageModel>>,
     summarization_model: Option<Arc<dyn LanguageModel>>,
+    summarization_service_tier: Option<String>,
     thinking_enabled: bool,
     thinking_effort: Option<String>,
     service_tier: Option<String>,
@@ -1115,6 +1116,7 @@ impl Thread {
             templates,
             model,
             summarization_model: None,
+            summarization_service_tier: None,
             thinking_enabled: enable_thinking,
             thinking_effort,
             service_tier,
@@ -1141,6 +1143,7 @@ impl Thread {
         self.thinking_enabled = parent.thinking_enabled;
         self.thinking_effort = parent.thinking_effort.clone();
         self.summarization_model = parent.summarization_model.clone();
+        self.summarization_service_tier = parent.summarization_service_tier.clone();
         self.profile_id = parent.profile_id.clone();
     }
 
@@ -1161,20 +1164,14 @@ impl Thread {
         self.model = Some(model.clone());
         self.thinking_enabled = selection.enable_thinking && model.supports_thinking();
         self.thinking_effort = selection.effort.clone();
-        self.service_tier = selection
-            .service_tier
-            .clone()
-            .filter(|value| {
-                model
-                    .supported_service_tiers()
-                    .iter()
-                    .any(|tier| tier.value.as_ref() == value.as_str())
-            })
-            .or_else(|| {
-                model
-                    .default_service_tier()
-                    .map(|tier| tier.value.to_string())
-            });
+        if let Some(tier) = selection.service_tier.as_ref() {
+            self.service_tier = model
+                .supported_service_tiers()
+                .iter()
+                .any(|t| t.value == tier.as_ref())
+                .then(|| tier.clone())
+                .or_else(|| model.default_service_tier().map(|t| t.value.to_string()));
+        }
         self.prompt_capabilities_tx
             .send(Self::prompt_capabilities(self.model.as_deref()))
             .log_err();
@@ -1394,6 +1391,7 @@ impl Thread {
                     let model = SelectedModel {
                         provider: model.provider.clone().into(),
                         model: model.model.into(),
+                        service_tier: db_thread.service_tier.clone(),
                     };
                     registry.select_model(&model, cx)
                 })
@@ -1442,6 +1440,7 @@ impl Thread {
             templates,
             model,
             summarization_model: None,
+            summarization_service_tier: None,
             thinking_enabled: db_thread.thinking_enabled,
             thinking_effort: db_thread.thinking_effort,
             service_tier: db_thread.service_tier,
@@ -1580,14 +1579,16 @@ impl Thread {
     pub fn set_summarization_model(
         &mut self,
         model: Option<Arc<dyn LanguageModel>>,
+        service_tier: Option<String>,
         cx: &mut Context<Self>,
     ) {
         self.summarization_model = model.clone();
+        self.summarization_service_tier = service_tier.clone();
 
         for subagent in &self.running_subagents {
             subagent
                 .update(cx, |thread, cx| {
-                    thread.set_summarization_model(model.clone(), cx)
+                    thread.set_summarization_model(model.clone(), service_tier.clone(), cx)
                 })
                 .ok();
         }
@@ -1896,6 +1897,7 @@ impl Thread {
         let selected = SelectedModel {
             provider: LanguageModelProviderId::from(selection.provider.0.clone()),
             model: LanguageModelId::from(selection.model.clone()),
+            service_tier: selection.service_tier.clone(),
         };
         LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
             registry
@@ -2772,6 +2774,8 @@ impl Thread {
         let mut request = LanguageModelRequest {
             intent: Some(CompletionIntent::ThreadContextSummarization),
             temperature: AgentSettings::temperature_for_model(&model, cx),
+            service_tier: AgentSettings::service_tier_for_model(&model, cx)
+                .or(self.summarization_service_tier.clone()),
             ..Default::default()
         };
 
@@ -2835,6 +2839,8 @@ impl Thread {
         let mut request = LanguageModelRequest {
             intent: Some(CompletionIntent::ThreadSummarization),
             temperature: AgentSettings::temperature_for_model(&model, cx),
+            service_tier: AgentSettings::service_tier_for_model(&model, cx)
+                .or(self.summarization_service_tier.clone()),
             ..Default::default()
         };
 
@@ -3011,7 +3017,8 @@ impl Thread {
             temperature: AgentSettings::temperature_for_model(model, cx),
             thinking_allowed: self.thinking_enabled,
             thinking_effort: self.thinking_effort.clone(),
-            service_tier: self.service_tier().cloned(),
+            service_tier: AgentSettings::service_tier_for_model(model, cx)
+                .or_else(|| self.service_tier().cloned()),
         };
 
         log::debug!("Completion request built successfully");
@@ -4847,7 +4854,7 @@ mod tests {
 
         cx.update(|cx| {
             parent.update(cx, |thread, cx| {
-                thread.set_summarization_model(Some(summary_model), cx);
+                thread.set_summarization_model(Some(summary_model), None, cx);
             });
 
             for subagent in &subagents {
