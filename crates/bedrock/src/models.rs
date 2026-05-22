@@ -611,24 +611,14 @@ impl Model {
                 })
                 .unwrap_or_default(),
 
-            Self::ClaudeSonnet4 | Self::ClaudeOpus4_1 | Self::ClaudeOpus4_7 => vec![],
-
-            Self::ClaudeHaiku4_5
+            Self::ClaudeSonnet4
+            | Self::ClaudeOpus4_1
+            | Self::ClaudeOpus4_7
+            | Self::ClaudeHaiku4_5
             | Self::ClaudeSonnet4_5
             | Self::ClaudeOpus4_5
             | Self::ClaudeOpus4_6
-            | Self::ClaudeSonnet4_6 => vec![
-                ServiceTierInfo {
-                    name: SharedString::new_static("Standard"),
-                    value: SharedString::new_static("default"),
-                    is_default: true,
-                },
-                ServiceTierInfo {
-                    name: SharedString::new_static("Reserved"),
-                    value: SharedString::new_static("reserved"),
-                    is_default: false,
-                },
-            ],
+            | Self::ClaudeSonnet4_6 => vec![],
 
             Self::NovaLite => vec![],
 
@@ -674,9 +664,7 @@ impl Model {
 
             Self::Llama4Scout17B | Self::Llama4Maverick17B => vec![],
 
-            Self::Qwen3CoderNext => vec![],
-
-            _ => vec![
+            Self::GptOss20B | Self::GptOss120B => vec![
                 ServiceTierInfo {
                     name: SharedString::new_static("Standard"),
                     value: SharedString::new_static("default"),
@@ -693,6 +681,46 @@ impl Model {
                     is_default: false,
                 },
             ],
+
+            Self::Qwen3_32B | Self::Qwen3_235B | Self::Qwen3Coder480B => vec![
+                ServiceTierInfo {
+                    name: SharedString::new_static("Standard"),
+                    value: SharedString::new_static("default"),
+                    is_default: true,
+                },
+                ServiceTierInfo {
+                    name: SharedString::new_static("Priority"),
+                    value: SharedString::new_static("priority"),
+                    is_default: false,
+                },
+                ServiceTierInfo {
+                    name: SharedString::new_static("Flex"),
+                    value: SharedString::new_static("flex"),
+                    is_default: false,
+                },
+            ],
+
+            Self::GLM5 | Self::GLM4_7 | Self::GLM4_7Flash => vec![
+                ServiceTierInfo {
+                    name: SharedString::new_static("Standard"),
+                    value: SharedString::new_static("default"),
+                    is_default: true,
+                },
+                ServiceTierInfo {
+                    name: SharedString::new_static("Priority"),
+                    value: SharedString::new_static("priority"),
+                    is_default: false,
+                },
+                ServiceTierInfo {
+                    name: SharedString::new_static("Flex"),
+                    value: SharedString::new_static("flex"),
+                    is_default: false,
+                },
+            ],
+
+            Self::Qwen3CoderNext => vec![],
+
+            _ => vec![],
         }
     }
 

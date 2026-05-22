@@ -142,9 +142,14 @@ impl Model {
     pub fn supported_service_tiers(&self) -> Vec<ServiceTierInfo> {
         vec![
             ServiceTierInfo {
+                name: SharedString::new_static("Auto"),
+                value: SharedString::new_static("auto"),
+                is_default: true,
+            },
+            ServiceTierInfo {
                 name: SharedString::new_static("Default"),
                 value: SharedString::new_static("default"),
-                is_default: true,
+                is_default: false,
             },
             ServiceTierInfo {
                 name: SharedString::new_static("Flex"),
@@ -154,6 +159,11 @@ impl Model {
             ServiceTierInfo {
                 name: SharedString::new_static("Priority"),
                 value: SharedString::new_static("priority"),
+                is_default: false,
+            },
+            ServiceTierInfo {
+                name: SharedString::new_static("Scale"),
+                value: SharedString::new_static("scale"),
                 is_default: false,
             },
         ]

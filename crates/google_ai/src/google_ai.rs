@@ -678,7 +678,7 @@ impl Model {
     }
 
     pub fn supported_service_tiers(&self) -> Vec<ServiceTierInfo> {
-        vec![
+        let tiers = vec![
             ServiceTierInfo {
                 name: SharedString::new_static("Standard"),
                 value: SharedString::new_static("standard"),
@@ -694,7 +694,25 @@ impl Model {
                 value: SharedString::new_static("priority"),
                 is_default: false,
             },
-        ]
+        ];
+
+        let supports_flex_and_priority = matches!(
+            self,
+            Self::Gemini25FlashLite
+                | Self::Gemini25Flash
+                | Self::Gemini25Pro
+                | Self::Gemini31FlashLite
+                | Self::Gemini3Flash
+                | Self::Gemini35Flash
+                | Self::Gemini31Pro
+                | Self::Custom { .. }
+        );
+
+        if supports_flex_and_priority {
+            tiers
+        } else {
+            vec![tiers.into_iter().next().unwrap()]
+        }
     }
 }
 

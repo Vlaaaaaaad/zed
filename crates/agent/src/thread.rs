@@ -4984,6 +4984,38 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_service_tier_includes_in_completion_request(cx: &mut TestAppContext) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+
+        let model = Arc::new(FakeLanguageModel::default());
+        model.set_service_tiers(vec![
+            language_model::ServiceTierInfo {
+                name: "Standard".into(),
+                value: "default".into(),
+                is_default: true,
+            },
+            language_model::ServiceTierInfo {
+                name: "Priority".into(),
+                value: "priority".into(),
+                is_default: false,
+            },
+        ]);
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread.set_service_tier(Some("priority".to_string()), cx);
+            });
+
+            let request = thread
+                .read(cx)
+                .build_completion_request(CompletionIntent::UserPrompt, cx)
+                .unwrap();
+            assert_eq!(request.service_tier, Some("priority".to_string()));
+        });
+    }
+
+    #[gpui::test]
     async fn test_dropped_subagent_does_not_panic(cx: &mut TestAppContext) {
         let (parent, _event_stream) = setup_thread_for_test(cx).await;
         let subagents = setup_parent_with_subagents(cx, &parent, 1);

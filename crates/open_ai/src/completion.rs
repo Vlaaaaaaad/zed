@@ -1409,28 +1409,37 @@ mod tests {
             serialized["input"],
             json!([
                 {
-                    "type": "reasoning",
-                    "id": "rs_123",
-                    "summary": [
-                        {
-                            "type": "summary_text",
-                            "text": "Checked what information is needed."
-                        }
-                    ],
+                    "type": "message",
+                    "role": "system",
                     "content": [
-                        {
-                            "type": "reasoning_text",
-                            "text": "Internal reasoning text."
-                        }
-                    ],
-                    "encrypted_content": "ENC",
-                    "status": "completed"
+                        { "type": "input_text", "text": "System context" }
+                    ]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        { "type": "input_text", "text": "Please check the weather." },
+                        { "type": "input_image", "image_url": "data:image/png;base64,aGVsbG8=" }
+                    ]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        { "type": "output_text", "text": "Looking that up.", "annotations": [] }
+                    ]
                 },
                 {
                     "type": "function_call",
                     "call_id": "call-42",
                     "name": "get_weather",
                     "arguments": tool_arguments
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-42",
+                    "output": "Sunny"
                 }
             ])
         );
@@ -1438,7 +1447,10 @@ mod tests {
             serialized["include"],
             json!(["reasoning.encrypted_content"])
         );
-        assert_eq!(serialized.get("reasoning"), None);
+        assert_eq!(
+            serialized["reasoning"],
+            json!({ "effort": "high", "summary": "auto" })
+        );
     }
 
     #[test]

@@ -246,7 +246,7 @@ impl AgentSettingsContent {
 
     pub fn add_favorite_model(&mut self, model: LanguageModelSelection) {
         // Note: this is intentional to not compare using `PartialEq`here.
-        // Full equality would treat entries that differ just in thinking/effort/speed
+        // Full equality would treat entries that differ just in thinking/effort/service_tier
         // as distinct and silently produce duplicates.
         if !self
             .favorite_models
