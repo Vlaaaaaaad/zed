@@ -434,10 +434,16 @@ impl LanguageModelRegistry {
     pub fn default_fast_model(&self, cx: &App) -> Option<ConfiguredModel> {
         let configured = self.default_model()?;
         let fast_model = configured.provider.default_fast_model(cx)?;
+        let service_tier = configured.service_tier.clone().filter(|tier| {
+            fast_model
+                .supported_service_tiers()
+                .iter()
+                .any(|t| t.value.as_ref() == tier.as_str())
+        });
         Some(ConfiguredModel {
             provider: configured.provider.clone(),
             model: fast_model,
-            service_tier: configured.service_tier.clone(),
+            service_tier,
         })
     }
 

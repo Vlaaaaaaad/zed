@@ -105,7 +105,7 @@ impl Model {
         vec![
             language_model_core::ServiceTierInfo {
                 name: SharedString::new_static("Standard"),
-                value: SharedString::new_static("standard"),
+                value: SharedString::new_static("default"),
                 is_default: true,
             },
             language_model_core::ServiceTierInfo {

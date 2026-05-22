@@ -1171,6 +1171,8 @@ impl Thread {
                 .any(|t| t.value == tier.as_ref())
                 .then(|| tier.clone())
                 .or_else(|| model.default_service_tier().map(|t| t.value.to_string()));
+        } else {
+            self.service_tier = model.default_service_tier().map(|t| t.value.to_string());
         }
         self.prompt_capabilities_tx
             .send(Self::prompt_capabilities(self.model.as_deref()))

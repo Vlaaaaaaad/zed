@@ -140,8 +140,8 @@ impl Model {
     }
 
     pub fn supported_service_tiers(&self) -> Vec<ServiceTierInfo> {
-        let supports_service_tiers = self.name.starts_with("openai/")
-            || self.name.starts_with("google/");
+        let supports_service_tiers =
+            self.name.starts_with("openai/") || self.name.starts_with("google/");
 
         if !supports_service_tiers {
             return Vec::new();
