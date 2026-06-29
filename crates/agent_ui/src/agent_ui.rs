@@ -966,6 +966,7 @@ mod tests {
     use project::DisableAiSettings;
     use settings::{
         DockPosition, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, Settings, SettingsStore,
+        ToolCallDisplay,
     };
 
     #[gpui::test]
@@ -1020,6 +1021,7 @@ mod tests {
             show_merge_conflict_indicator: true,
             sidebar_side: Default::default(),
             thinking_display: Default::default(),
+            tool_call_display: ToolCallDisplay::default(),
         };
 
         cx.update(|cx| {

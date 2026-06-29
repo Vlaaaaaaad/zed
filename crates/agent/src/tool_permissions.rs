@@ -563,7 +563,7 @@ mod tests {
     use crate::{AgentTool, EditFileTool};
     use agent_settings::{AgentProfileId, CompiledRegex, InvalidRegexPattern, ToolRules};
     use gpui::px;
-    use settings::{DockPosition, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone};
+    use settings::{DockPosition, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, ToolCallDisplay};
     use std::sync::Arc;
 
     fn test_agent_settings(tool_permissions: ToolPermissions) -> AgentSettings {
@@ -607,6 +607,7 @@ mod tests {
             show_merge_conflict_indicator: true,
             sidebar_side: Default::default(),
             thinking_display: Default::default(),
+            tool_call_display: ToolCallDisplay::default(),
         }
     }
 

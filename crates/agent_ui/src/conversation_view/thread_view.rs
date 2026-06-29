@@ -7,6 +7,7 @@ use crate::{
 };
 use agent_client_protocol::schema::v1 as acp;
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use acp_thread::{
     PlanEntry, SandboxAuthorizationDetails, SandboxFallbackAuthorizationDetails,
@@ -35,7 +36,7 @@ use language_model::{
     FastModeConfirmation, LanguageModel, LanguageModelEffortLevel, LanguageModelId,
     LanguageModelProvider, LanguageModelProviderId, LanguageModelRegistry, Speed,
 };
-use settings::{update_settings_file, update_settings_file_with_completion};
+use settings::{ToolCallDisplay, update_settings_file, update_settings_file_with_completion};
 use ui::{
     ButtonLike, CalloutBorderPosition, SpinnerLabel, SpinnerVariant, SplitButton, SplitButtonStyle,
     Tab,
@@ -43,6 +44,7 @@ use ui::{
 use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
 
 use super::*;
+use crate::entry_view_state::{ToolCallBundle, get_bundle_for_entry, tool_kind_info};
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
 
@@ -1016,6 +1018,9 @@ impl ThreadView {
 
         this.sync_generating_indicator(cx);
         this.sync_editor_mode_for_empty_state(cx);
+        this.entry_view_state.update(cx, |state, cx| {
+            state.recompute_bundles(this.thread.read(cx).entries(), None);
+        });
         let list_state_for_scroll = this.list_state.clone();
         let thread_view = cx.entity().downgrade();
 
@@ -5716,9 +5721,17 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
     }
 }
 
+enum BundleSurface {
+    /// The bundle system fully handles this entry — return the element as-is.
+    ShortCircuit(AnyElement),
+    /// Continue with normal entry rendering, optionally prepending a header.
+    Continue { header: Option<AnyElement> },
+}
 impl ThreadView {
     fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
+        let tool_call_display = AgentSettings::get_global(cx).tool_call_display;
+        let bundles = self.entry_view_state.read(cx).bundles().clone();
         let centered_container = move |content: AnyElement| {
             h_flex().w_full().justify_center().child(
                 div()
@@ -5733,7 +5746,15 @@ impl ThreadView {
             cx.processor(move |this, index: usize, window, cx| {
                 let entries = this.thread.read(cx).entries();
                 if let Some(entry) = entries.get(index) {
-                    let rendered = this.render_entry(index, entries.len(), entry, window, cx);
+                    let rendered = this.render_entry(
+                        index,
+                        entry,
+                        entries,
+                        &bundles,
+                        tool_call_display,
+                        window,
+                        cx,
+                    );
                     centered_container(rendered.into_any_element()).into_any_element()
                 } else if this.generating_indicator_in_list {
                     let confirmation = entries
@@ -5753,11 +5774,14 @@ impl ThreadView {
     fn render_entry(
         &self,
         entry_ix: usize,
-        total_entries: usize,
         entry: &AgentThreadEntry,
+        entries: &[AgentThreadEntry],
+        bundles: &[ToolCallBundle],
+        tool_call_display: ToolCallDisplay,
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
+        let total_entries = entries.len();
         let is_indented = entry.is_indented();
         let is_first_indented = is_indented
             && self
@@ -5955,106 +5979,153 @@ impl ThreadView {
                 indented: _,
                 is_subagent_output: _,
             }) => {
-                let mut is_blank = true;
-                let is_last = entry_ix + 1 == total_entries;
+                let surface =
+                    self.resolve_bundle_surface(entry_ix, entry, bundles, tool_call_display, cx);
+                match surface {
+                    BundleSurface::ShortCircuit(element) => element,
+                    BundleSurface::Continue {
+                        header: bundle_header,
+                    } => {
+                        // Skip thoughts when inside a collapsed bundle — the bundle's
+                        // label already counts them.
+                        let skip_thoughts =
+                            matches!(
+                                tool_call_display,
+                                ToolCallDisplay::Auto | ToolCallDisplay::Compact
+                            ) && get_bundle_for_entry(bundles, entry_ix).map_or(false, |b| {
+                                !self
+                                    .entry_view_state
+                                    .read(cx)
+                                    .tool_call_bundle_state(&b.id, tool_call_display)
+                            });
 
-                let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
-                let message_body = v_flex()
-                    .w_full()
-                    .gap_3()
-                    .children(chunks.iter().enumerate().filter_map(
-                        |(chunk_ix, chunk)| match chunk {
-                            AssistantMessageChunk::Message { block, .. } => {
-                                block.markdown().and_then(|md| {
-                                    let this_is_blank = md.read(cx).source().trim().is_empty();
-                                    is_blank = is_blank && this_is_blank;
-                                    if this_is_blank {
-                                        return None;
+                        let mut is_blank = true;
+                        let is_last = entry_ix + 1 == total_entries;
+
+                        let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+                        let message_body = v_flex()
+                            .w_full()
+                            .gap_3()
+                            .children(chunks.iter().enumerate().filter_map(|(chunk_ix, chunk)| {
+                                match chunk {
+                                    AssistantMessageChunk::Thought { .. } if skip_thoughts => None,
+                                    AssistantMessageChunk::Message { block, .. } => {
+                                        block.markdown().and_then(|md| {
+                                            let this_is_blank =
+                                                md.read(cx).source().trim().is_empty();
+                                            is_blank = is_blank && this_is_blank;
+                                            if this_is_blank {
+                                                return None;
+                                            }
+
+                                            Some(
+                                                self.render_markdown(md.clone(), style.clone(), cx)
+                                                    .into_any_element(),
+                                            )
+                                        })
                                     }
-
-                                    Some(
-                                        self.render_markdown(md.clone(), style.clone(), cx)
-                                            .into_any_element(),
-                                    )
-                                })
-                            }
-                            AssistantMessageChunk::Thought { block, .. } => {
-                                block.markdown().and_then(|md| {
-                                    let this_is_blank = md.read(cx).source().trim().is_empty();
-                                    is_blank = is_blank && this_is_blank;
-                                    if this_is_blank {
-                                        return None;
+                                    AssistantMessageChunk::Thought { block, .. } => {
+                                        block.markdown().and_then(|md| {
+                                            let this_is_blank =
+                                                md.read(cx).source().trim().is_empty();
+                                            is_blank = is_blank && this_is_blank;
+                                            if this_is_blank {
+                                                return None;
+                                            }
+                                            Some(
+                                                self.render_thinking_block(
+                                                    entry_ix,
+                                                    chunk_ix,
+                                                    md.clone(),
+                                                    window,
+                                                    cx,
+                                                )
+                                                .into_any_element(),
+                                            )
+                                        })
                                     }
-                                    Some(
-                                        self.render_thinking_block(
-                                            entry_ix,
-                                            chunk_ix,
-                                            md.clone(),
-                                            window,
-                                            cx,
-                                        )
-                                        .into_any_element(),
-                                    )
-                                })
-                            }
-                        },
-                    ))
-                    .into_any();
+                                }
+                            }))
+                            .into_any();
 
-                if is_blank {
-                    Empty.into_any()
-                } else {
-                    v_flex()
-                        .px_5()
-                        .py_1p5()
-                        .when(is_last, |this| this.pb_4())
-                        .w_full()
-                        .text_ui(cx)
-                        .child(self.render_message_context_menu(entry_ix, message_body, cx))
-                        .when_some(
-                            self.entry_view_state
-                                .read(cx)
-                                .entry(entry_ix)
-                                .and_then(|entry| entry.focus_handle(cx)),
-                            |this, handle| this.track_focus(&handle),
-                        )
-                        .into_any()
+                        let content = if is_blank {
+                            Empty.into_any()
+                        } else {
+                            v_flex()
+                                .px_5()
+                                .py_1p5()
+                                .when(is_last, |this| this.pb_4())
+                                .w_full()
+                                .text_ui(cx)
+                                .child(self.render_message_context_menu(entry_ix, message_body, cx))
+                                .when_some(
+                                    self.entry_view_state
+                                        .read(cx)
+                                        .entry(entry_ix)
+                                        .and_then(|entry| entry.focus_handle(cx)),
+                                    |this, handle| this.track_focus(&handle),
+                                )
+                                .into_any()
+                        };
+
+                        if let Some(bundle_header) = bundle_header {
+                            if is_blank {
+                                bundle_header
+                            } else {
+                                v_flex().child(bundle_header).child(content).into_any()
+                            }
+                        } else {
+                            content
+                        }
+                    }
                 }
             }
             AgentThreadEntry::ToolCall(tool_call) => {
-                // A canceled tool call that produced visible output is still worth
-                // showing, but one that was canceled before producing anything just
-                // renders as a useless "Canceled" card — hide those entirely.
-                if matches!(tool_call.status, ToolCallStatus::Canceled) {
-                    let has_visible_content =
-                        tool_call.content.iter().any(|content| match content {
-                            ToolCallContent::ContentBlock(block) => block.visible_content(cx),
-                            ToolCallContent::Diff(_) | ToolCallContent::Terminal(_) => true,
-                        });
-                    if !has_visible_content {
-                        return Empty.into_any();
+                let surface =
+                    self.resolve_bundle_surface(entry_ix, entry, bundles, tool_call_display, cx);
+                match surface {
+                    BundleSurface::ShortCircuit(element) => element,
+                    BundleSurface::Continue { header } => {
+                        if matches!(tool_call.status, ToolCallStatus::Canceled) {
+                            let has_visible_content =
+                                tool_call.content.iter().any(|content| match content {
+                                    ToolCallContent::ContentBlock(block) => {
+                                        block.visible_content(cx)
+                                    }
+                                    ToolCallContent::Diff(_) | ToolCallContent::Terminal(_) => true,
+                                });
+                            if !has_visible_content {
+                                return Empty.into_any();
+                            }
+                        }
+
+                        let tool_call = self.render_any_tool_call(
+                            self.thread.read(cx).session_id(),
+                            entry_ix,
+                            tool_call,
+                            &self.focus_handle(cx),
+                            ToolCallLayout::Standalone,
+                            window,
+                            cx,
+                        );
+
+                        let content = if let Some(handle) = self
+                            .entry_view_state
+                            .read(cx)
+                            .entry(entry_ix)
+                            .and_then(|entry| entry.focus_handle(cx))
+                        {
+                            tool_call.track_focus(&handle).into_any()
+                        } else {
+                            tool_call.into_any()
+                        };
+
+                        if let Some(header) = header {
+                            v_flex().child(header).child(content).into_any()
+                        } else {
+                            content
+                        }
                     }
-                }
-
-                let tool_call = self.render_any_tool_call(
-                    self.thread.read(cx).session_id(),
-                    entry_ix,
-                    tool_call,
-                    &self.focus_handle(cx),
-                    ToolCallLayout::Standalone,
-                    window,
-                    cx,
-                );
-
-                if let Some(handle) = self
-                    .entry_view_state
-                    .read(cx)
-                    .entry(entry_ix)
-                    .and_then(|entry| entry.focus_handle(cx))
-                {
-                    tool_call.track_focus(&handle).into_any()
-                } else {
-                    tool_call.into_any()
                 }
             }
             AgentThreadEntry::CompletedPlan(entries) => {
@@ -6105,6 +6176,40 @@ impl ThreadView {
 
         let primary = if is_indented {
             let line_top = if is_first_indented {
+                rems_from_px(-12.0)
+            } else {
+                rems_from_px(0.0)
+            };
+
+            div()
+                .relative()
+                .w_full()
+                .pl_5()
+                .bg(cx.theme().colors().panel_background.opacity(0.2))
+                .child(
+                    div()
+                        .absolute()
+                        .left(rems_from_px(18.0))
+                        .top(line_top)
+                        .bottom_0()
+                        .w_px()
+                        .bg(cx.theme().colors().border.opacity(0.6)),
+                )
+                .child(primary)
+                .into_any_element()
+        } else {
+            primary
+        };
+
+        let primary = if let Some(bundle) = get_bundle_for_entry(bundles, entry_ix)
+            && self
+                .entry_view_state
+                .read(cx)
+                .tool_call_bundle_state(&bundle.id, tool_call_display)
+        {
+            let is_first_in_bundle = entry_ix == bundle.start_index;
+
+            let line_top = if is_first_in_bundle {
                 rems_from_px(-12.0)
             } else {
                 rems_from_px(0.0)
@@ -6790,10 +6895,147 @@ impl ThreadView {
         }
     }
 
-    pub(crate) fn clear_auto_expand_tracking(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn clear_auto_expanded_thinking(&mut self, cx: &mut Context<Self>) {
         self.entry_view_state.update(cx, |state, _cx| {
-            state.clear_auto_expand_tracking();
+            state.clear_auto_expanded_thinking();
         });
+    }
+
+    pub(crate) fn auto_expand_streaming_bundles(&mut self, cx: &mut Context<Self>) {
+        let thread = self.thread.clone();
+        let changed = self.entry_view_state.update(cx, |state, cx| {
+            let thread = thread.read(cx);
+            state.auto_expand_streaming_bundles(thread, cx)
+        });
+        if changed {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn auto_compact_bundles(&mut self, cx: &mut Context<Self>) {
+        let changed = self
+            .entry_view_state
+            .update(cx, |state, cx| state.auto_compact_bundles(cx));
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn resolve_bundle_surface(
+        &self,
+        entry_ix: usize,
+        entry: &AgentThreadEntry,
+        bundles: &[ToolCallBundle],
+        tool_call_display: ToolCallDisplay,
+        cx: &Context<Self>,
+    ) -> BundleSurface {
+        let Some(bundle) = get_bundle_for_entry(bundles, entry_ix) else {
+            return BundleSurface::Continue { header: None };
+        };
+        let is_expanded = self
+            .entry_view_state
+            .read(cx)
+            .tool_call_bundle_state(&bundle.id, tool_call_display);
+        let is_assistant_message = matches!(entry, AgentThreadEntry::AssistantMessage(_));
+        if !is_expanded {
+            if entry_ix == bundle.start_index {
+                if is_assistant_message {
+                    // AssistantMessages render their text even when collapsed,
+                    // with thoughts skipped. The header goes above the text.
+                    BundleSurface::Continue {
+                        header: Some(self.render_bundle_header_row(
+                            bundle,
+                            false,
+                            tool_call_display,
+                            cx,
+                        )),
+                    }
+                } else {
+                    BundleSurface::ShortCircuit(self.render_bundle_header_row(
+                        bundle,
+                        false,
+                        tool_call_display,
+                        cx,
+                    ))
+                }
+            } else if is_assistant_message {
+                // Non-start AssistantMessages in a collapsed bundle: render
+                // text content, skip thoughts.
+                BundleSurface::Continue { header: None }
+            } else {
+                BundleSurface::ShortCircuit(Empty.into_any())
+            }
+        } else if entry_ix == bundle.start_index {
+            BundleSurface::Continue {
+                header: Some(self.render_bundle_header_row(bundle, true, tool_call_display, cx)),
+            }
+        } else {
+            BundleSurface::Continue { header: None }
+        }
+    }
+
+    fn render_bundle_header_row(
+        &self,
+        bundle: &ToolCallBundle,
+        is_open: bool, // Controls the disclosure chevron direction only.
+        tool_call_display: ToolCallDisplay,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let group_id = bundle.group_id.clone();
+
+        h_flex()
+            .id(("compact-bundle", bundle.start_index))
+            .group(&group_id)
+            .py_1p5()
+            .pl_8()
+            .pr_2()
+            .gap_2()
+            .rounded_md()
+            .justify_between()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Label::new(bundle.label.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .children(bundle.kind_counts_iter().map(|(kind, count)| {
+                        h_flex()
+                            .gap_0p5()
+                            .px_1()
+                            .child(
+                                Icon::new(tool_kind_info(&kind).1)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new(format!("{}", count))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .into_any_element()
+                    })),
+            )
+            .when(tool_call_display != ToolCallDisplay::Expanded, |el| {
+                el.child(
+                    Disclosure::new(("compact-bundle-disclosure", bundle.start_index), is_open)
+                        .opened_icon(IconName::ChevronUp)
+                        .closed_icon(IconName::ChevronDown)
+                        .visible_on_hover(&group_id),
+                )
+                .on_click(cx.listener({
+                    let bundle_id = bundle.id.clone();
+                    let entry_view_state = self.entry_view_state.clone();
+                    move |_this, _event, _window, cx| {
+                        entry_view_state.update(cx, |state, cx| {
+                            state.toggle_tool_call_bundle_expansion(&bundle_id, cx);
+                        });
+                        cx.notify();
+                    }
+                }))
+            })
+            .into_any_element()
     }
 
     fn toggle_thinking_block_expansion(
@@ -9162,21 +9404,10 @@ impl ThreadView {
                 .color(Color::Muted)
                 .into_any_element()
         } else {
-            Icon::new(match tool_call.kind {
-                acp::ToolKind::Read => IconName::ToolSearch,
-                acp::ToolKind::Edit => IconName::ToolPencil,
-                acp::ToolKind::Delete => IconName::ToolDeleteFile,
-                acp::ToolKind::Move => IconName::ArrowRightLeft,
-                acp::ToolKind::Search => IconName::ToolSearch,
-                acp::ToolKind::Execute => IconName::ToolTerminal,
-                acp::ToolKind::Think => IconName::ToolThink,
-                acp::ToolKind::Fetch => IconName::ToolWeb,
-                acp::ToolKind::SwitchMode => IconName::ArrowRightLeft,
-                acp::ToolKind::Other | _ => IconName::ToolHammer,
-            })
-            .size(IconSize::Small)
-            .color(Color::Muted)
-            .into_any_element()
+            Icon::new(tool_kind_info(&tool_call.kind).1)
+                .size(IconSize::Small)
+                .color(Color::Muted)
+                .into_any_element()
         };
 
         let gradient_overlay = {
@@ -10086,6 +10317,8 @@ impl ThreadView {
 
         scroll_handle.scroll_to_bottom();
 
+        let tool_call_display = AgentSettings::get_global(cx).tool_call_display;
+        let bundles = subagent_view.entry_view_state.read(cx).bundles().clone();
         let rendered_entries: Vec<AnyElement> = entries
             .get(entry_range)
             .unwrap_or_default()
@@ -10093,7 +10326,15 @@ impl ThreadView {
             .enumerate()
             .map(|(i, entry)| {
                 let actual_ix = start_ix + i;
-                subagent_view.render_entry(actual_ix, total_entries, entry, window, cx)
+                subagent_view.render_entry(
+                    actual_ix,
+                    entry,
+                    entries,
+                    &bundles,
+                    tool_call_display,
+                    window,
+                    cx,
+                )
             })
             .collect();
 

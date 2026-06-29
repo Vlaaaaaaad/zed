@@ -71,6 +71,34 @@ pub enum ThinkingBlockDisplay {
     AlwaysCollapsed,
 }
 
+/// How consecutive tool calls should be displayed in the agent panel.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallDisplay {
+    /// Consecutive tool calls auto-compact into an icon strip after streaming
+    /// completes. During streaming, the latest bundle stays expanded so you
+    /// can follow along. Manually expanded bundles stay expanded.
+    #[default]
+    Auto,
+    /// Consecutive tool calls are always shown compacted as an icon strip.
+    Compact,
+    /// Tool calls are always shown expanded (never compacted).
+    Expanded,
+}
+
 /// Threshold at which agent auto-compaction runs. See
 /// [`AutoCompactSettingsContent::threshold`] for the accepted formats.
 ///
@@ -309,6 +337,10 @@ pub struct AgentSettingsContent {
     ///
     /// Default: automatic
     pub thinking_display: Option<ThinkingBlockDisplay>,
+    /// How consecutive tool calls should be displayed in the agent panel.
+    ///
+    /// Default: auto
+    pub tool_call_display: Option<ToolCallDisplay>,
     /// Whether clicking the stop button on a running terminal tool should also cancel the agent's generation.
     /// Note that this only applies to the stop button, not to ctrl+c inside the terminal.
     ///

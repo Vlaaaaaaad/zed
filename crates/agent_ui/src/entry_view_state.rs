@@ -1,6 +1,7 @@
 use std::ops::Range;
+use std::rc::Rc;
 
-use acp_thread::{AcpThread, AgentThreadEntry, AssistantMessageChunk};
+use acp_thread::{AcpThread, AgentThreadEntry, AssistantMessageChunk, ThreadStatus};
 use agent::ThreadStore;
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::AgentSettings;
@@ -8,15 +9,15 @@ use collections::{HashMap, HashSet};
 use editor::{Editor, EditorEvent, EditorMode, MinimapVisibility, SizingBehavior};
 use gpui::{
     AnyEntity, App, AppContext as _, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    ScrollHandle, TextStyleRefinement, WeakEntity, Window,
+    ScrollHandle, SharedString, TextStyleRefinement, WeakEntity, Window,
 };
 use language::language_settings::SoftWrap;
 use project::{AgentId, Project, project_settings::DiagnosticSeverity};
 use rope::Point;
-use settings::{Settings as _, ThinkingBlockDisplay};
+use settings::{Settings as _, ThinkingBlockDisplay, ToolCallDisplay};
 use terminal_view::TerminalView;
 use theme_settings::ThemeSettings;
-use ui::{Context, TextSize};
+use ui::{Context, IconName, TextSize};
 use workspace::Workspace;
 
 use crate::message_editor::{MessageEditor, MessageEditorEvent, SharedSessionCapabilities};
@@ -33,6 +34,249 @@ fn reindex_after_removal(index: usize, removed: &Range<usize>) -> Option<usize> 
     }
 }
 
+/// Hint about what changed since the last bundle computation,
+/// allowing a scoped recomputation of only the affected suffix.
+#[derive(Clone, Debug)]
+pub(crate) enum BundleRecomputeHint {
+    /// A new entry was appended at the given index (always len-1).
+    NewEntry(usize),
+    /// An existing entry was updated at the given index.
+    EntryUpdated(usize),
+    /// A range of entries was removed.
+    EntriesRemoved { range: Range<usize> },
+}
+
+/// Stable identifier for a bundle, surviving entry removals and reordering
+/// when possible. Tool-call bundles are keyed by the first tool call's ID;
+/// pure-thought bundles (which have no tool call ID) fall back to positional.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum BundleId {
+    ToolCall(acp::ToolCallId),
+    Thoughts(usize),
+}
+
+const TOOL_KIND_COUNT: usize = 10;
+
+#[derive(Clone, Debug)]
+pub(crate) struct ToolCallBundle {
+    pub start_index: usize,
+    pub end_index: usize,
+    /// Total tool call count. Used in tests; in production the pre-computed
+    /// `label` field carries this information to the renderer.
+    #[allow(dead_code)]
+    pub tool_call_count: usize,
+    #[allow(dead_code)]
+    pub thought_count: usize,
+    /// Per-kind tool call counts, indexed by `tool_kind_sort_key`.
+    kind_counts: [u32; TOOL_KIND_COUNT],
+    /// Thought chunks from the mixed message immediately after the bundle,
+    /// pre-computed so rendering doesn't need to reach into the entries slice.
+    #[allow(dead_code)]
+    pub trailing_thought_count: usize,
+    pub id: BundleId,
+    pub label: SharedString,
+    pub group_id: SharedString,
+}
+
+impl ToolCallBundle {
+    /// Iterates over tool kinds that have a non-zero count, in sort order.
+    pub fn kind_counts_iter(&self) -> impl Iterator<Item = (acp::ToolKind, u32)> + '_ {
+        self.kind_counts
+            .iter()
+            .enumerate()
+            .filter_map(|(key, &count)| {
+                if count > 0 {
+                    Some((tool_kind_from_sort_key(key), count))
+                } else {
+                    None
+                }
+            })
+    }
+}
+
+fn is_entry_bundle_eligible(entry: &AgentThreadEntry) -> bool {
+    match entry {
+        AgentThreadEntry::ToolCall(tool_call) => {
+            !tool_call.is_subagent()
+                && !matches!(
+                    tool_call.status,
+                    acp_thread::ToolCallStatus::WaitingForConfirmation { .. }
+                )
+                && !matches!(tool_call.status, acp_thread::ToolCallStatus::Canceled)
+        }
+        AgentThreadEntry::AssistantMessage(msg) => {
+            !msg.chunks.is_empty()
+                && msg
+                    .chunks
+                    .iter()
+                    .any(|chunk| matches!(chunk, AssistantMessageChunk::Thought { .. }))
+        }
+        _ => false,
+    }
+}
+
+/// A terminating entry is counted into the current bundle but ends the run
+/// afterwards. Mixed messages (thoughts + text) are terminating so output
+/// text doesn't get swallowed into a mega-bundle.
+fn is_entry_bundle_terminating(entry: &AgentThreadEntry) -> bool {
+    matches!(entry, AgentThreadEntry::AssistantMessage(msg) if msg.chunks.iter().any(|c| {
+        !matches!(c, AssistantMessageChunk::Thought { .. })
+    }))
+}
+
+fn count_entry(
+    entry: &AgentThreadEntry,
+    tool_call_count: &mut usize,
+    thought_count: &mut usize,
+    kind_counts: &mut [u32; TOOL_KIND_COUNT],
+    first_tool_call_id: &mut Option<acp::ToolCallId>,
+) {
+    match entry {
+        AgentThreadEntry::ToolCall(tool_call) => {
+            *tool_call_count += 1;
+            kind_counts[tool_kind_sort_key(&tool_call.kind) as usize] += 1;
+            if first_tool_call_id.is_none() {
+                *first_tool_call_id = Some(tool_call.id.clone());
+            }
+        }
+        AgentThreadEntry::AssistantMessage(msg) => {
+            *thought_count += msg
+                .chunks
+                .iter()
+                .filter(|c| matches!(c, AssistantMessageChunk::Thought { .. }))
+                .count();
+        }
+        _ => {}
+    }
+}
+
+fn trailing_thought_count(entries: &[AgentThreadEntry], at: usize) -> usize {
+    if let Some(AgentThreadEntry::AssistantMessage(msg)) = entries.get(at) {
+        msg.chunks
+            .iter()
+            .filter(|c| matches!(c, AssistantMessageChunk::Thought { .. }))
+            .count()
+    } else {
+        0
+    }
+}
+
+fn bundle_label(thought_count: usize, tool_call_count: usize) -> SharedString {
+    match (thought_count, tool_call_count) {
+        (0, 1) => SharedString::from("1 tool call"),
+        (0, t) => SharedString::from(format!("{} tool calls", t)),
+        (1, 0) => SharedString::from("1 thinking block"),
+        (b, 0) => SharedString::from(format!("{} thinking blocks", b)),
+        (1, 1) => SharedString::from("1 thinking block · 1 tool call"),
+        (1, t) => SharedString::from(format!("1 thinking block · {} tool calls", t)),
+        (b, 1) => SharedString::from(format!("{} thinking blocks · 1 tool call", b)),
+        (b, t) => SharedString::from(format!("{} thinking blocks · {} tool calls", b, t)),
+    }
+}
+
+pub(crate) fn tool_kind_info(kind: &acp::ToolKind) -> (u8, IconName) {
+    match kind {
+        acp::ToolKind::Read => (0, IconName::ToolSearch),
+        acp::ToolKind::Edit => (1, IconName::ToolPencil),
+        acp::ToolKind::Delete => (2, IconName::ToolDeleteFile),
+        acp::ToolKind::Move => (3, IconName::ArrowRightLeft),
+        acp::ToolKind::Search => (4, IconName::ToolSearch),
+        acp::ToolKind::Execute => (5, IconName::ToolTerminal),
+        acp::ToolKind::Think => (6, IconName::ToolThink),
+        acp::ToolKind::Fetch => (7, IconName::ToolWeb),
+        acp::ToolKind::SwitchMode => (8, IconName::ArrowRightLeft),
+        acp::ToolKind::Other | _ => (9, IconName::ToolHammer),
+    }
+}
+
+fn tool_kind_sort_key(kind: &acp::ToolKind) -> u8 {
+    tool_kind_info(kind).0
+}
+
+fn tool_kind_from_sort_key(key: usize) -> acp::ToolKind {
+    match key {
+        0 => acp::ToolKind::Read,
+        1 => acp::ToolKind::Edit,
+        2 => acp::ToolKind::Delete,
+        3 => acp::ToolKind::Move,
+        4 => acp::ToolKind::Search,
+        5 => acp::ToolKind::Execute,
+        6 => acp::ToolKind::Think,
+        7 => acp::ToolKind::Fetch,
+        8 => acp::ToolKind::SwitchMode,
+        _ => acp::ToolKind::Other,
+    }
+}
+
+/// Compute bundles for a slice of entries, adding `offset` to all indices.
+fn compute_tool_call_bundles(entries: &[AgentThreadEntry], offset: usize) -> Vec<ToolCallBundle> {
+    let mut bundles = Vec::new();
+    let mut i = 0;
+    while i < entries.len() {
+        while i < entries.len() && !is_entry_bundle_eligible(&entries[i]) {
+            i += 1;
+        }
+        if i >= entries.len() {
+            break;
+        }
+
+        let run_start = i;
+        let mut tool_call_count = 0;
+        let mut thought_count = 0;
+        let mut kind_counts = [0u32; TOOL_KIND_COUNT];
+        let mut first_tool_call_id: Option<acp::ToolCallId> = None;
+
+        while i < entries.len() && is_entry_bundle_eligible(&entries[i]) {
+            count_entry(
+                &entries[i],
+                &mut tool_call_count,
+                &mut thought_count,
+                &mut kind_counts,
+                &mut first_tool_call_id,
+            );
+            i += 1;
+            if is_entry_bundle_terminating(&entries[i - 1]) {
+                break;
+            }
+        }
+
+        let run_len = i - run_start;
+        if run_len > 1 {
+            let start_index = run_start + offset;
+            let end_index = i + offset;
+            let id = match first_tool_call_id {
+                Some(tc_id) => BundleId::ToolCall(tc_id),
+                None => BundleId::Thoughts(start_index),
+            };
+            let total_thoughts = thought_count + trailing_thought_count(entries, i);
+            bundles.push(ToolCallBundle {
+                start_index,
+                end_index,
+                tool_call_count,
+                thought_count,
+                kind_counts,
+                trailing_thought_count: trailing_thought_count(entries, i),
+                label: bundle_label(total_thoughts, tool_call_count),
+                id,
+                group_id: SharedString::from(format!("bundle-header-{}", start_index)),
+            });
+        }
+    }
+    bundles
+}
+
+pub(crate) fn get_bundle_for_entry(
+    bundles: &[ToolCallBundle],
+    entry_ix: usize,
+) -> Option<&ToolCallBundle> {
+    let idx = bundles
+        .binary_search_by_key(&entry_ix, |b| b.start_index)
+        .unwrap_or_else(|err| err.saturating_sub(1));
+    bundles
+        .get(idx)
+        .filter(|b| (b.start_index..b.end_index).contains(&entry_ix))
+}
+
 pub struct EntryViewState {
     workspace: WeakEntity<Workspace>,
     project: WeakEntity<Project>,
@@ -45,6 +289,15 @@ pub struct EntryViewState {
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     expanded_compactions: HashSet<usize>,
     expanded_tool_calls: HashSet<acp::ToolCallId>,
+    tool_call_bundle_states: HashSet<BundleId>,
+    /// Bundles the user explicitly collapsed during streaming, to prevent
+    /// auto-expand from immediately re-opening them.
+    user_collapsed_bundles: HashSet<BundleId>,
+    /// The bundle currently auto-expanded during streaming, tracked so it
+    /// can be compacted when streaming stops. `None` when no bundle is
+    /// auto-expanded (or the user has taken over).
+    auto_expanded_bundle: Option<BundleId>,
+    bundles: Rc<[ToolCallBundle]>,
 }
 
 impl EntryViewState {
@@ -67,7 +320,15 @@ impl EntryViewState {
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
+            tool_call_bundle_states: HashSet::default(),
+            user_collapsed_bundles: HashSet::default(),
+            auto_expanded_bundle: None,
+            bundles: Rc::new([]),
         }
+    }
+
+    pub(crate) fn bundles(&self) -> &Rc<[ToolCallBundle]> {
+        &self.bundles
     }
 
     pub(crate) fn is_tool_call_expanded(&self, tool_call_id: &acp::ToolCallId) -> bool {
@@ -102,7 +363,7 @@ impl EntryViewState {
         }
     }
 
-    pub(crate) fn clear_auto_expand_tracking(&mut self) {
+    pub(crate) fn clear_auto_expanded_thinking(&mut self) {
         self.auto_expanded_thinking_block = None;
     }
 
@@ -214,6 +475,182 @@ impl EntryViewState {
             }
             ThinkingBlockDisplay::AlwaysExpanded => (!is_user_toggled, false),
             ThinkingBlockDisplay::AlwaysCollapsed => (is_user_toggled, false),
+        }
+    }
+
+    pub(crate) fn toggle_tool_call_bundle_expansion(&mut self, bundle_id: &BundleId, cx: &App) {
+        match AgentSettings::get_global(cx).tool_call_display {
+            ToolCallDisplay::Auto | ToolCallDisplay::Compact => {
+                if self.tool_call_bundle_states.contains(bundle_id) {
+                    self.tool_call_bundle_states.remove(bundle_id);
+                    if self.auto_expanded_bundle.as_ref() == Some(bundle_id) {
+                        self.auto_expanded_bundle = None;
+                        self.user_collapsed_bundles.insert(bundle_id.clone());
+                    }
+                } else {
+                    self.tool_call_bundle_states.insert(bundle_id.clone());
+                    self.user_collapsed_bundles.remove(bundle_id);
+                }
+            }
+            ToolCallDisplay::Expanded => {}
+        }
+    }
+
+    pub(crate) fn tool_call_bundle_state(
+        &self,
+        bundle_id: &BundleId,
+        tool_call_display: ToolCallDisplay,
+    ) -> bool {
+        match tool_call_display {
+            ToolCallDisplay::Expanded => true,
+            ToolCallDisplay::Auto | ToolCallDisplay::Compact => {
+                self.tool_call_bundle_states.contains(bundle_id)
+            }
+        }
+    }
+
+    /// Returns true when the entry is a non-first member of a collapsed
+    /// bundle — i.e. it renders as `Empty` and takes no visual space.
+    pub(crate) fn is_entry_in_collapsed_bundle(
+        &self,
+        entry_ix: usize,
+        tool_call_display: ToolCallDisplay,
+    ) -> bool {
+        match get_bundle_for_entry(&self.bundles, entry_ix) {
+            Some(bundle) if entry_ix != bundle.start_index => {
+                !self.tool_call_bundle_state(&bundle.id, tool_call_display)
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn auto_expand_streaming_bundles(&mut self, thread: &AcpThread, cx: &App) -> bool {
+        if AgentSettings::get_global(cx).tool_call_display != ToolCallDisplay::Auto {
+            return false;
+        }
+        if thread.status() != ThreadStatus::Generating {
+            return false;
+        }
+        let Some(latest) = self.bundles.last() else {
+            return false;
+        };
+        let key = latest.id.clone();
+
+        if self.tool_call_bundle_states.contains(&key) {
+            return false;
+        }
+        if self.user_collapsed_bundles.contains(&key) {
+            return false;
+        }
+
+        if let Some(old) = self.auto_expanded_bundle.take() {
+            self.tool_call_bundle_states.remove(&old);
+        }
+        self.tool_call_bundle_states.insert(key.clone());
+        self.auto_expanded_bundle = Some(key);
+        true
+    }
+
+    pub(crate) fn auto_compact_bundles(&mut self, cx: &App) -> bool {
+        if AgentSettings::get_global(cx).tool_call_display == ToolCallDisplay::Expanded {
+            return false;
+        }
+
+        let mut changed = false;
+        if let Some(key) = self.auto_expanded_bundle.take() {
+            self.tool_call_bundle_states.remove(&key);
+            changed = true;
+        }
+        if !self.user_collapsed_bundles.is_empty() {
+            self.user_collapsed_bundles.clear();
+            changed = true;
+        }
+        changed
+    }
+
+    pub(crate) fn recompute_bundles(
+        &mut self,
+        entries: &[AgentThreadEntry],
+        hint: Option<BundleRecomputeHint>,
+    ) {
+        // Skip recompute for ToolCalls whose eligibility hasn't changed and
+        // that aren't at a bundle boundary. AssistantMessages always
+        // recompute because their thought chunk count may change during
+        // streaming without affecting eligibility.
+        if let Some(BundleRecomputeHint::EntryUpdated(index)) = &hint {
+            let is_tool_call = matches!(entries.get(*index), Some(AgentThreadEntry::ToolCall(_)));
+            if is_tool_call {
+                let is_eligible = entries.get(*index).is_some_and(is_entry_bundle_eligible);
+                let was_in_bundle = get_bundle_for_entry(&self.bundles, *index).is_some();
+                let is_trailing = self
+                    .bundles
+                    .binary_search_by_key(index, |b| b.end_index)
+                    .is_ok();
+
+                if !is_trailing && was_in_bundle == is_eligible {
+                    return;
+                }
+            }
+        }
+
+        let new_bundles = match &hint {
+            Some(hint) => {
+                let affected_start = self.affected_start(entries, hint);
+                let prefix: Vec<ToolCallBundle> = self
+                    .bundles
+                    .iter()
+                    .take_while(|b| b.end_index <= affected_start)
+                    .cloned()
+                    .collect();
+                let suffix = compute_tool_call_bundles(&entries[affected_start..], affected_start);
+                let mut all = prefix;
+                all.extend(suffix);
+                all
+            }
+            None => compute_tool_call_bundles(entries, 0),
+        };
+        self.bundles = Rc::from(new_bundles);
+        self.prune_bundle_states();
+    }
+
+    /// Finds the earliest entry index whose bundle might be affected by the
+    /// hinted change. Bundles entirely before this index are preserved as-is.
+    fn affected_start(&self, entries: &[AgentThreadEntry], hint: &BundleRecomputeHint) -> usize {
+        match hint {
+            BundleRecomputeHint::NewEntry(index) | BundleRecomputeHint::EntryUpdated(index) => {
+                let mut start = *index;
+                if let Some(b) = get_bundle_for_entry(&self.bundles, *index) {
+                    start = start.min(b.start_index);
+                }
+                if *index > 0 {
+                    if let Some(b) = get_bundle_for_entry(&self.bundles, index - 1) {
+                        if b.end_index == *index {
+                            start = start.min(b.start_index);
+                        }
+                    }
+                }
+                // Walk back through contiguous eligible entries to catch
+                // singletons that might form or join a bundle.
+                while start > 0 && is_entry_bundle_eligible(&entries[start - 1]) {
+                    start -= 1;
+                }
+                start
+            }
+            BundleRecomputeHint::EntriesRemoved { range } => range.start,
+        }
+    }
+
+    /// Drops expansion state for bundles that no longer exist.
+    fn prune_bundle_states(&mut self) {
+        let valid_ids: HashSet<&BundleId> = self.bundles.iter().map(|b| &b.id).collect();
+        self.tool_call_bundle_states
+            .retain(|id| valid_ids.contains(id));
+        self.user_collapsed_bundles
+            .retain(|id| valid_ids.contains(id));
+        if let Some(ref auto_id) = self.auto_expanded_bundle {
+            if !valid_ids.contains(auto_id) {
+                self.auto_expanded_bundle = None;
+            }
         }
     }
 
@@ -689,8 +1126,9 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Arc;
 
-    use acp_thread::{AgentConnection, StubAgentConnection};
+    use acp_thread::{AgentConnection, AgentThreadEntry, StubAgentConnection};
     use agent_client_protocol::schema::v1 as acp;
+    use agent_settings;
     use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
     use editor::RowInfo;
     use fs::FakeFs;
@@ -703,7 +1141,7 @@ mod tests {
     use pretty_assertions::assert_matches;
     use project::Project;
     use serde_json::json;
-    use settings::SettingsStore;
+    use settings::{Settings, SettingsStore};
     use util::path;
     use workspace::{MultiWorkspace, PathList};
 
@@ -829,6 +1267,439 @@ mod tests {
         );
     }
 
+    // --- Helpers for bundle tests ---
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TOOL_CALL_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_tool_call_id() -> acp::ToolCallId {
+        acp::ToolCallId::new(format!(
+            "tool-call-{}",
+            NEXT_TOOL_CALL_ID.fetch_add(1, Ordering::SeqCst)
+        ))
+    }
+
+    fn tool_call_entry(
+        cx: &mut gpui::App,
+        kind: acp::ToolKind,
+        status: acp_thread::ToolCallStatus,
+    ) -> AgentThreadEntry {
+        use acp_thread::ToolCall;
+        AgentThreadEntry::ToolCall(ToolCall {
+            id: unique_tool_call_id(),
+            label: cx.new(|cx| markdown::Markdown::new("test".into(), None, None, cx)),
+            kind,
+            content: vec![],
+            status,
+            locations: vec![],
+            resolved_locations: vec![],
+            raw_input: None,
+            raw_input_markdown: None,
+            raw_output: None,
+            tool_name: None,
+            subagent_session_info: None,
+            sandbox_authorization_details: None,
+            sandbox_fallback_authorization_details: None,
+            sandbox_not_applied: None,
+        })
+    }
+
+    fn tool_call_with_tool_name(
+        cx: &mut gpui::App,
+        kind: acp::ToolKind,
+        status: acp_thread::ToolCallStatus,
+        tool_name: impl Into<gpui::SharedString>,
+    ) -> AgentThreadEntry {
+        use acp_thread::ToolCall;
+        AgentThreadEntry::ToolCall(ToolCall {
+            id: unique_tool_call_id(),
+            label: cx.new(|cx| markdown::Markdown::new("test".into(), None, None, cx)),
+            kind,
+            content: vec![],
+            status,
+            locations: vec![],
+            resolved_locations: vec![],
+            raw_input: None,
+            raw_input_markdown: None,
+            raw_output: None,
+            tool_name: Some(tool_name.into()),
+            subagent_session_info: None,
+            sandbox_authorization_details: None,
+            sandbox_fallback_authorization_details: None,
+            sandbox_not_applied: None,
+        })
+    }
+
+    fn thought_entry() -> AgentThreadEntry {
+        use acp_thread::{AssistantMessage, AssistantMessageChunk, ContentBlock};
+        AgentThreadEntry::AssistantMessage(AssistantMessage {
+            chunks: vec![AssistantMessageChunk::Thought {
+                id: None,
+                block: ContentBlock::Empty,
+            }],
+            indented: false,
+            is_subagent_output: false,
+        })
+    }
+
+    fn user_entry() -> AgentThreadEntry {
+        use acp_thread::{ContentBlock, UserMessage};
+        AgentThreadEntry::UserMessage(UserMessage {
+            protocol_id: None,
+            client_id: None,
+            is_optimistic: false,
+            content: ContentBlock::Empty,
+            chunks: vec![],
+            checkpoint: None,
+            indented: false,
+        })
+    }
+
+    /// A mixed AssistantMessage with the given number of thought chunks
+    /// plus one non-thought (message) chunk. Not bundle-eligible.
+    fn mixed_thought_message(thought_count: usize) -> AgentThreadEntry {
+        use acp_thread::{AssistantMessage, AssistantMessageChunk, ContentBlock};
+        let mut chunks: Vec<_> = (0..thought_count)
+            .map(|_| AssistantMessageChunk::Thought {
+                id: None,
+                block: ContentBlock::Empty,
+            })
+            .collect();
+        chunks.push(AssistantMessageChunk::Message {
+            id: None,
+            block: ContentBlock::Empty,
+        });
+        AgentThreadEntry::AssistantMessage(AssistantMessage {
+            chunks,
+            indented: false,
+            is_subagent_output: false,
+        })
+    }
+
+    // --- Bundle computation tests ---
+
+    fn kind_count(bundle: &super::ToolCallBundle, kind: acp::ToolKind) -> u32 {
+        bundle
+            .kind_counts_iter()
+            .find(|(k, _)| *k == kind)
+            .map(|(_, c)| c)
+            .unwrap_or(0)
+    }
+
+    #[gpui::test]
+    async fn test_compute_tool_call_bundles_empty(cx: &mut TestAppContext) {
+        init_test(cx);
+        let entries = cx.update(|_| vec![]);
+        let bundles = super::compute_tool_call_bundles(&entries, 0);
+        assert!(bundles.is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_compute_tool_call_bundles_two_tool_calls(cx: &mut TestAppContext) {
+        init_test(cx);
+        let entries = cx.update(|cx| {
+            vec![
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Read,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Edit,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+            ]
+        });
+        let bundles = super::compute_tool_call_bundles(&entries, 0);
+        assert_eq!(bundles.len(), 1);
+        let bundle = &bundles[0];
+        assert_eq!(bundle.start_index, 0);
+        assert_eq!(bundle.end_index, 2);
+        assert_eq!(bundle.tool_call_count, 2);
+        assert_eq!(bundle.thought_count, 0);
+        assert_eq!(kind_count(bundle, acp::ToolKind::Read), 1);
+        assert_eq!(kind_count(bundle, acp::ToolKind::Edit), 1);
+    }
+
+    #[gpui::test]
+    async fn test_compute_tool_call_bundles_mixed_tool_calls_and_thoughts(cx: &mut TestAppContext) {
+        init_test(cx);
+        let entries = cx.update(|cx| {
+            vec![
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Read,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                thought_entry(),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Edit,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                thought_entry(),
+            ]
+        });
+        let bundles = super::compute_tool_call_bundles(&entries, 0);
+        assert_eq!(bundles.len(), 1);
+        let bundle = &bundles[0];
+        assert_eq!(bundle.start_index, 0);
+        assert_eq!(bundle.end_index, 4);
+        assert_eq!(bundle.tool_call_count, 2);
+        assert_eq!(bundle.thought_count, 2);
+        assert_eq!(kind_count(bundle, acp::ToolKind::Read), 1);
+        assert_eq!(kind_count(bundle, acp::ToolKind::Edit), 1);
+    }
+
+    #[gpui::test]
+    async fn test_compute_tool_call_bundles_boundary_at_user_message(cx: &mut TestAppContext) {
+        init_test(cx);
+        let entries = cx.update(|cx| {
+            vec![
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Read,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Edit,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                user_entry(),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Read,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Edit,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+            ]
+        });
+        let bundles = super::compute_tool_call_bundles(&entries, 0);
+        assert_eq!(bundles.len(), 2);
+        assert_eq!(bundles[0].start_index, 0);
+        assert_eq!(bundles[0].end_index, 2);
+        assert_eq!(bundles[1].start_index, 3);
+        assert_eq!(bundles[1].end_index, 5);
+    }
+
+    #[gpui::test]
+    async fn test_compute_tool_call_bundles_boundary_at_waiting_for_confirmation(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (respond_tx, _respond_rx) = futures::channel::oneshot::channel();
+        let entries = cx.update(|cx| {
+            vec![
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Read,
+                    acp_thread::ToolCallStatus::WaitingForConfirmation {
+                        current_status: acp::ToolCallStatus::Pending,
+                        options: acp_thread::PermissionOptions::Flat(vec![]),
+                        respond_tx,
+                        kind: acp_thread::AuthorizationKind::PermissionGrant,
+                    },
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Read,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Edit,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+            ]
+        });
+        let bundles = super::compute_tool_call_bundles(&entries, 0);
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].start_index, 1);
+        assert_eq!(bundles[0].end_index, 3);
+        assert_eq!(bundles[0].tool_call_count, 2);
+    }
+
+    #[gpui::test]
+    async fn test_compute_tool_call_bundles_subagent_not_eligible(cx: &mut TestAppContext) {
+        init_test(cx);
+        let entries = cx.update(|cx| {
+            vec![
+                tool_call_with_tool_name(
+                    cx,
+                    acp::ToolKind::Read,
+                    acp_thread::ToolCallStatus::Completed,
+                    "spawn_agent",
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Read,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Edit,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+            ]
+        });
+        let bundles = super::compute_tool_call_bundles(&entries, 0);
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].start_index, 1);
+        assert_eq!(bundles[0].end_index, 3);
+    }
+
+    #[gpui::test]
+    async fn test_compute_tool_call_bundles_pure_thought_message(cx: &mut TestAppContext) {
+        init_test(cx);
+        let entries = cx.update(|_| vec![thought_entry(), thought_entry()]);
+        let bundles = super::compute_tool_call_bundles(&entries, 0);
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].start_index, 0);
+        assert_eq!(bundles[0].end_index, 2);
+        assert_eq!(bundles[0].tool_call_count, 0);
+        assert_eq!(bundles[0].thought_count, 2);
+    }
+
+    #[gpui::test]
+    async fn test_compute_tool_call_bundles_mixed_message_terminates(cx: &mut TestAppContext) {
+        init_test(cx);
+        // A mixed message (thoughts + text) is eligible but terminating —
+        // it ends the bundle. [Tool, Mixed, Tool, Tool] => two bundles.
+        let entries = cx.update(|cx| {
+            vec![
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Read,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                mixed_thought_message(1),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Edit,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Read,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+            ]
+        });
+        let bundles = super::compute_tool_call_bundles(&entries, 0);
+        assert_eq!(bundles.len(), 2);
+        assert_eq!(bundles[0].start_index, 0);
+        assert_eq!(bundles[0].end_index, 2);
+        assert_eq!(bundles[0].tool_call_count, 1);
+        assert_eq!(bundles[0].thought_count, 1);
+        assert_eq!(bundles[1].start_index, 2);
+        assert_eq!(bundles[1].end_index, 4);
+        assert_eq!(bundles[1].tool_call_count, 2);
+    }
+
+    #[gpui::test]
+    async fn test_compute_tool_call_bundles_pure_text_message_is_boundary(cx: &mut TestAppContext) {
+        init_test(cx);
+        // A pure-text message (no thoughts) is a hard boundary.
+        use acp_thread::{AssistantMessage, AssistantMessageChunk, ContentBlock};
+        let text_message = AgentThreadEntry::AssistantMessage(AssistantMessage {
+            chunks: vec![AssistantMessageChunk::Message {
+                id: None,
+                block: ContentBlock::Empty,
+            }],
+            indented: false,
+            is_subagent_output: false,
+        });
+        let entries = cx.update(|cx| {
+            vec![
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Read,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                text_message,
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Edit,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+            ]
+        });
+        let bundles = super::compute_tool_call_bundles(&entries, 0);
+        // The text message breaks the run: two singletons, no bundle.
+        assert!(bundles.is_empty());
+    }
+
+    // --- get_bundle_for_entry tests ---
+
+    #[gpui::test]
+    async fn test_get_bundle_for_entry_in_bundle(cx: &mut TestAppContext) {
+        init_test(cx);
+        let entries = cx.update(|cx| {
+            vec![
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Read,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Edit,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+            ]
+        });
+        let bundles = super::compute_tool_call_bundles(&entries, 0);
+        assert_eq!(bundles.len(), 1);
+
+        let found = super::get_bundle_for_entry(&bundles, 0);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().start_index, 0);
+
+        let found = super::get_bundle_for_entry(&bundles, 1);
+        assert!(found.is_some());
+    }
+
+    #[gpui::test]
+    async fn test_get_bundle_for_entry_not_in_bundle(cx: &mut TestAppContext) {
+        init_test(cx);
+        let entries = cx.update(|cx| {
+            vec![
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Read,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Edit,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                user_entry(),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Read,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Edit,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+            ]
+        });
+        let bundles = super::compute_tool_call_bundles(&entries, 0);
+        assert_eq!(bundles.len(), 2);
+
+        assert!(super::get_bundle_for_entry(&bundles, 2).is_none());
+    }
+
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
@@ -836,5 +1707,526 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             release_channel::init(semver::Version::new(0, 0, 0), cx);
         });
+    }
+
+    /// Creates an `EntryViewState` with invalid weak entity references.
+    fn make_entry_view_state(cx: &mut TestAppContext) -> gpui::Entity<EntryViewState> {
+        cx.new(|_cx| {
+            EntryViewState::new(
+                gpui::WeakEntity::new_invalid(),
+                gpui::WeakEntity::new_invalid(),
+                None,
+                Arc::new(parking_lot::RwLock::new(SessionCapabilities::default())),
+                project::AgentId::new("Test Agent"),
+            )
+        })
+    }
+
+    // ---------------------------------------------------------------------------
+    // recompute_bundles tests
+    // ---------------------------------------------------------------------------
+
+    #[gpui::test]
+    async fn test_recompute_new_entry_appends_to_run(cx: &mut TestAppContext) {
+        init_test(cx);
+        let view_state = make_entry_view_state(cx);
+        let entries = cx.update(|cx| {
+            vec![
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Read,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Edit,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+            ]
+        });
+        view_state.update(cx, |state, _cx| {
+            state.recompute_bundles(&entries, None);
+        });
+        assert_eq!(view_state.read_with(cx, |s, _| s.bundles().len()), 1);
+
+        // Append Tool(Delete, Completed) at index 2
+        let mut updated = entries;
+        updated.push(cx.update(|cx| {
+            tool_call_entry(
+                cx,
+                acp::ToolKind::Delete,
+                acp_thread::ToolCallStatus::Completed,
+            )
+        }));
+        view_state.update(cx, |state, _cx| {
+            state.recompute_bundles(&updated, Some(super::BundleRecomputeHint::NewEntry(2)));
+        });
+
+        let bundle = view_state.read_with(cx, |s, _| s.bundles()[0].clone());
+        assert_eq!(bundle.start_index, 0);
+        assert_eq!(bundle.end_index, 3);
+        assert_eq!(bundle.tool_call_count, 3);
+    }
+
+    #[gpui::test]
+    async fn test_recompute_new_entry_ineligible(cx: &mut TestAppContext) {
+        init_test(cx);
+        let view_state = make_entry_view_state(cx);
+        let entries = cx.update(|cx| {
+            vec![
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Read,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Edit,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+            ]
+        });
+        view_state.update(cx, |state, _cx| {
+            state.recompute_bundles(&entries, None);
+        });
+
+        // Append a user message at index 2 (ineligible)
+        let mut updated = entries;
+        updated.push(user_entry());
+        view_state.update(cx, |state, _cx| {
+            state.recompute_bundles(&updated, Some(super::BundleRecomputeHint::NewEntry(2)));
+        });
+
+        let bundles = view_state.read_with(cx, |s, _| s.bundles().clone());
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].start_index, 0);
+        assert_eq!(bundles[0].end_index, 2);
+    }
+
+    #[gpui::test]
+    async fn test_recompute_entry_updated_becomes_ineligible(cx: &mut TestAppContext) {
+        init_test(cx);
+        let view_state = make_entry_view_state(cx);
+        let entries = cx.update(|cx| {
+            vec![
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Read,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Edit,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Delete,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+            ]
+        });
+        view_state.update(cx, |state, _cx| {
+            state.recompute_bundles(&entries, None);
+        });
+
+        // Entry at index 1 becomes Canceled (ineligible)
+        let mut updated = entries;
+        updated[1] = cx.update(|cx| {
+            tool_call_entry(
+                cx,
+                acp::ToolKind::Edit,
+                acp_thread::ToolCallStatus::Canceled,
+            )
+        });
+        view_state.update(cx, |state, _cx| {
+            state.recompute_bundles(&updated, Some(super::BundleRecomputeHint::EntryUpdated(1)));
+        });
+
+        let bundles = view_state.read_with(cx, |s, _| s.bundles().clone());
+        assert!(
+            bundles.is_empty(),
+            "waiting tool breaks eligibility; no bundles expected"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_recompute_entry_updated_becomes_eligible(cx: &mut TestAppContext) {
+        init_test(cx);
+        let view_state = make_entry_view_state(cx);
+        let (respond_tx, _respond_rx) = futures::channel::oneshot::channel();
+        let entries = cx.update(|cx| {
+            vec![
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Read,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Edit,
+                    acp_thread::ToolCallStatus::WaitingForConfirmation {
+                        current_status: acp::ToolCallStatus::Pending,
+                        options: acp_thread::PermissionOptions::Flat(vec![]),
+                        respond_tx,
+                        kind: acp_thread::AuthorizationKind::PermissionGrant,
+                    },
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Delete,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+            ]
+        });
+        view_state.update(cx, |state, _cx| {
+            state.recompute_bundles(&entries, None);
+        });
+        assert!(
+            view_state.read_with(cx, |s, _| s.bundles().is_empty()),
+            "waiting tool breaks eligibility; no bundles expected"
+        );
+
+        // Entry at index 1 becomes Completed (now eligible)
+        let mut updated = entries;
+        updated[1] = cx.update(|cx| {
+            tool_call_entry(
+                cx,
+                acp::ToolKind::Edit,
+                acp_thread::ToolCallStatus::Completed,
+            )
+        });
+        view_state.update(cx, |state, _cx| {
+            state.recompute_bundles(&updated, Some(super::BundleRecomputeHint::EntryUpdated(1)));
+        });
+
+        let bundles = view_state.read_with(cx, |s, _| s.bundles().clone());
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].start_index, 0);
+        assert_eq!(bundles[0].end_index, 3);
+        assert_eq!(bundles[0].tool_call_count, 3);
+    }
+
+    #[gpui::test]
+    async fn test_recompute_entry_updated_no_change_skips(cx: &mut TestAppContext) {
+        init_test(cx);
+        let view_state = make_entry_view_state(cx);
+        let entries = cx.update(|cx| {
+            vec![
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Read,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Edit,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+            ]
+        });
+        view_state.update(cx, |state, _cx| {
+            state.recompute_bundles(&entries, None);
+        });
+        let original = view_state.read_with(cx, |s, _| s.bundles().clone());
+
+        // "Update" entry 0 to the same state (still eligible)
+        view_state.update(cx, |state, _cx| {
+            state.recompute_bundles(&entries, Some(super::BundleRecomputeHint::EntryUpdated(0)));
+        });
+
+        // Bundles unchanged (same Rc pointer — recompute was skipped)
+        assert!(std::ptr::eq(
+            view_state
+                .read_with(cx, |s, _| s.bundles().clone())
+                .as_ref(),
+            original.as_ref()
+        ));
+    }
+
+    #[gpui::test]
+    async fn test_recompute_split_run_handled_correctly(cx: &mut TestAppContext) {
+        init_test(cx);
+        let view_state = make_entry_view_state(cx);
+        let entries = cx.update(|cx| {
+            (0..10)
+                .map(|_| {
+                    tool_call_entry(
+                        cx,
+                        acp::ToolKind::Read,
+                        acp_thread::ToolCallStatus::Completed,
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        view_state.update(cx, |state, _cx| {
+            state.recompute_bundles(&entries, None);
+        });
+
+        // Make entry 5 Canceled (ineligible)
+        let mut updated = entries;
+        updated[5] = cx.update(|cx| {
+            tool_call_entry(
+                cx,
+                acp::ToolKind::Read,
+                acp_thread::ToolCallStatus::Canceled,
+            )
+        });
+        view_state.update(cx, |state, _cx| {
+            state.recompute_bundles(&updated, Some(super::BundleRecomputeHint::EntryUpdated(5)));
+        });
+
+        let bundles = view_state.read_with(cx, |s, _| s.bundles().clone());
+        assert_eq!(bundles.len(), 2);
+        assert_eq!(bundles[0].start_index, 0);
+        assert_eq!(bundles[0].end_index, 5);
+        assert_eq!(bundles[0].tool_call_count, 5);
+        assert_eq!(bundles[1].start_index, 6);
+        assert_eq!(bundles[1].end_index, 10);
+        assert_eq!(bundles[1].tool_call_count, 4);
+    }
+
+    #[gpui::test]
+    async fn test_recompute_entries_removed(cx: &mut TestAppContext) {
+        init_test(cx);
+        let view_state = make_entry_view_state(cx);
+        let entries = cx.update(|cx| {
+            vec![
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Read,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Edit,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                user_entry(),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Delete,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Execute,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+            ]
+        });
+        view_state.update(cx, |state, _cx| {
+            state.recompute_bundles(&entries, None);
+        });
+        assert_eq!(view_state.read_with(cx, |s, _| s.bundles().len()), 2);
+
+        // Remove entries 3..5 (the last two tool calls)
+        let reduced: Vec<_> = entries.into_iter().take(3).collect();
+        view_state.update(cx, |state, _cx| {
+            state.recompute_bundles(
+                &reduced,
+                Some(super::BundleRecomputeHint::EntriesRemoved { range: 3..5 }),
+            );
+        });
+
+        let bundles = view_state.read_with(cx, |s, _| s.bundles().clone());
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].start_index, 0);
+        assert_eq!(bundles[0].end_index, 2);
+    }
+
+    // ---------------------------------------------------------------------------
+    // State management tests
+    // ---------------------------------------------------------------------------
+
+    #[gpui::test]
+    async fn test_toggle_bundle_expansion(cx: &mut TestAppContext) {
+        init_test(cx);
+        let view_state = make_entry_view_state(cx);
+        let bundle_id = super::BundleId::ToolCall(acp::ToolCallId::new("test-tc"));
+
+        // Default: not expanded
+        assert!(!view_state.read_with(cx, |s, _| {
+            s.tool_call_bundle_state(&bundle_id, settings::ToolCallDisplay::Auto)
+        }));
+
+        // Toggle on
+        view_state.update(cx, |state, cx| {
+            state.toggle_tool_call_bundle_expansion(&bundle_id, cx);
+        });
+        assert!(view_state.read_with(cx, |s, _| {
+            s.tool_call_bundle_state(&bundle_id, settings::ToolCallDisplay::Auto)
+        }));
+
+        // Toggle off
+        view_state.update(cx, |state, cx| {
+            state.toggle_tool_call_bundle_expansion(&bundle_id, cx);
+        });
+        assert!(!view_state.read_with(cx, |s, _| {
+            s.tool_call_bundle_state(&bundle_id, settings::ToolCallDisplay::Auto)
+        }));
+
+        // ToolCallDisplay::Expanded always returns true
+        view_state.update(cx, |_, cx| {
+            agent_settings::AgentSettings::override_global(
+                agent_settings::AgentSettings {
+                    tool_call_display: settings::ToolCallDisplay::Expanded,
+                    ..agent_settings::AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        assert!(view_state.read_with(cx, |s, _| {
+            s.tool_call_bundle_state(&bundle_id, settings::ToolCallDisplay::Expanded)
+        }));
+    }
+
+    #[gpui::test]
+    async fn test_bundle_state_survives_removal(cx: &mut TestAppContext) {
+        init_test(cx);
+        let view_state = make_entry_view_state(cx);
+        let entries = cx.update(|cx| {
+            vec![
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Read,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Edit,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                user_entry(),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Delete,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Execute,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+            ]
+        });
+        view_state.update(cx, |state, _cx| {
+            state.recompute_bundles(&entries, None);
+        });
+        let bundles = view_state.read_with(cx, |s, _| s.bundles().clone());
+        assert_eq!(bundles.len(), 2);
+
+        // Expand the first bundle (user action)
+        let first_id = bundles[0].id.clone();
+        view_state.update(cx, |state, cx| {
+            state.toggle_tool_call_bundle_expansion(&first_id, cx);
+        });
+
+        // Remove the second bundle (entries 3..5)
+        let reduced: Vec<_> = entries.into_iter().take(3).collect();
+        view_state.update(cx, |state, _cx| {
+            state.recompute_bundles(
+                &reduced,
+                Some(super::BundleRecomputeHint::EntriesRemoved { range: 3..5 }),
+            );
+        });
+
+        // First bundle's expansion state survives because it's keyed by
+        // ToolCallId, not positional index.
+        assert!(view_state.read_with(cx, |s, _| {
+            s.tool_call_bundle_state(&first_id, settings::ToolCallDisplay::Auto)
+        }));
+    }
+
+    #[gpui::test]
+    async fn test_auto_compact_bundles(cx: &mut TestAppContext) {
+        init_test(cx);
+        let view_state = make_entry_view_state(cx);
+        let bundle_id = super::BundleId::ToolCall(acp::ToolCallId::new("auto-tc"));
+
+        // Simulate auto-expand by inserting into the set and setting the field.
+        view_state.update(cx, |state, _cx| {
+            state.tool_call_bundle_states.insert(bundle_id.clone());
+            state.auto_expanded_bundle = Some(bundle_id.clone());
+        });
+
+        // auto_compact should remove the auto-expanded bundle
+        let changed = view_state.update(cx, |state, cx| state.auto_compact_bundles(cx));
+        assert!(changed);
+
+        assert!(!view_state.read_with(cx, |s, _| {
+            s.tool_call_bundle_state(&bundle_id, settings::ToolCallDisplay::Auto)
+        }));
+
+        // Calling auto_compact again with nothing to compact returns false
+        let changed = view_state.update(cx, |state, cx| state.auto_compact_bundles(cx));
+        assert!(!changed);
+
+        // auto_compact should NOT remove a user-toggled bundle
+        let user_id = super::BundleId::ToolCall(acp::ToolCallId::new("user-tc"));
+        view_state.update(cx, |state, cx| {
+            state.toggle_tool_call_bundle_expansion(&user_id, cx);
+        });
+
+        let changed = view_state.update(cx, |state, cx| state.auto_compact_bundles(cx));
+        assert!(!changed);
+
+        assert!(view_state.read_with(cx, |s, _| {
+            s.tool_call_bundle_state(&user_id, settings::ToolCallDisplay::Auto)
+        }));
+    }
+
+    #[gpui::test]
+    async fn test_user_collapse_resists_auto_expand(cx: &mut TestAppContext) {
+        init_test(cx);
+        let view_state = make_entry_view_state(cx);
+        let entries = cx.update(|cx| {
+            vec![
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Read,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+                tool_call_entry(
+                    cx,
+                    acp::ToolKind::Edit,
+                    acp_thread::ToolCallStatus::Completed,
+                ),
+            ]
+        });
+        view_state.update(cx, |state, _cx| {
+            state.recompute_bundles(&entries, None);
+        });
+
+        let bundle_id = view_state.read_with(cx, |s, _| s.bundles()[0].id.clone());
+
+        // Simulate auto-expand (set ToolCallDisplay::Auto + Generating status
+        // is hard in unit tests, so we call auto_expand directly on the state).
+        // First, mark the thread as generating by inserting auto state manually.
+        view_state.update(cx, |state, _cx| {
+            state.tool_call_bundle_states.insert(bundle_id.clone());
+            state.auto_expanded_bundle = Some(bundle_id.clone());
+        });
+
+        // User collapses the auto-expanded bundle
+        view_state.update(cx, |state, cx| {
+            state.toggle_tool_call_bundle_expansion(&bundle_id, cx);
+        });
+
+        // The bundle should be collapsed
+        assert!(!view_state.read_with(cx, |s, _| {
+            s.tool_call_bundle_state(&bundle_id, settings::ToolCallDisplay::Auto)
+        }));
+
+        // And recorded in user_collapsed_bundles to prevent re-auto-expand
+        assert!(view_state.read_with(cx, |s, _| { s.user_collapsed_bundles.contains(&bundle_id) }));
+
+        // auto_compact clears user_collapsed_bundles for the next turn
+        view_state.update(cx, |state, cx| {
+            state.auto_compact_bundles(cx);
+        });
+        assert!(
+            !view_state.read_with(cx, |s, _| { s.user_collapsed_bundles.contains(&bundle_id) })
+        );
     }
 }

@@ -80,7 +80,7 @@ use crate::agent_connection_store::{
 };
 use crate::agent_diff::AgentDiff;
 use crate::completion_provider::{AgentContextSelection, AvailableSkill};
-use crate::entry_view_state::{EntryViewEvent, ViewEvent};
+use crate::entry_view_state::{BundleRecomputeHint, EntryViewEvent, ViewEvent};
 use crate::message_editor::{InputAttempt, MessageEditor, MessageEditorEvent};
 use crate::profile_selector::{ProfileProvider, ProfileSelector};
 
@@ -1509,10 +1509,14 @@ impl ConversationView {
                                 .entry(index)
                                 .and_then(|entry| entry.focus_handle(cx))],
                         );
+                        let entries = thread.read(cx).entries();
+                        view_state
+                            .recompute_bundles(entries, Some(BundleRecomputeHint::NewEntry(index)));
                     });
                     active.update(cx, |active, cx| {
                         active.sync_editor_mode_for_empty_state(cx);
                         active.sync_generating_indicator(cx);
+                        active.auto_expand_streaming_bundles(cx);
                     });
                 }
             }
@@ -1520,12 +1524,25 @@ impl ConversationView {
                 if let Some(active) = self.thread_view(&session_id) {
                     let entry_view_state = active.read(cx).entry_view_state.clone();
                     let list_state = active.read(cx).list_state.clone();
-                    entry_view_state.update(cx, |view_state, cx| {
+                    let is_invisible = entry_view_state.update(cx, |view_state, cx| {
                         view_state.sync_entry(*index, thread, window, cx);
+                        let entries = thread.read(cx).entries();
+                        view_state.recompute_bundles(
+                            entries,
+                            Some(BundleRecomputeHint::EntryUpdated(*index)),
+                        );
+                        let tool_call_display = AgentSettings::get_global(cx).tool_call_display;
+                        view_state.is_entry_in_collapsed_bundle(*index, tool_call_display)
                     });
                     list_state.remeasure_items(*index..*index + 1);
                     active.update(cx, |active, cx| {
-                        active.auto_expand_streaming_thought(cx);
+                        // sync_entry and recompute_bundles always run (even for
+                        // invisible entries) so content views are ready when the
+                        // bundle is later expanded.
+                        if !is_invisible {
+                            active.auto_expand_streaming_thought(cx);
+                            active.auto_expand_streaming_bundles(cx);
+                        }
                         active.sync_generating_indicator(cx);
                     });
                 }
@@ -1534,7 +1551,16 @@ impl ConversationView {
                 if let Some(active) = self.thread_view(&session_id) {
                     let entry_view_state = active.read(cx).entry_view_state.clone();
                     let list_state = active.read(cx).list_state.clone();
-                    entry_view_state.update(cx, |view_state, _cx| view_state.remove(range.clone()));
+                    entry_view_state.update(cx, |view_state, cx| {
+                        view_state.remove(range.clone());
+                        let entries = thread.read(cx).entries();
+                        view_state.recompute_bundles(
+                            entries,
+                            Some(BundleRecomputeHint::EntriesRemoved {
+                                range: range.clone(),
+                            }),
+                        );
+                    });
                     list_state.splice(range.clone(), 0);
                     active.update(cx, |active, cx| {
                         active.sync_editor_mode_for_empty_state(cx);
@@ -1562,7 +1588,8 @@ impl ConversationView {
                     active.update(cx, |active, cx| {
                         if !is_generating {
                             active.thread_retry_status.take();
-                            active.clear_auto_expand_tracking(cx);
+                            active.clear_auto_expanded_thinking(cx);
+                            active.auto_compact_bundles(cx);
                             if active.list_state.is_following_tail() {
                                 active.list_state.scroll_to_end();
                             }
